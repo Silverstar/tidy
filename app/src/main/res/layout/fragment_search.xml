@@ -18,8 +18,17 @@
             android:id="@+id/searchText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="e.g. &quot;Black cat sitting on a table&quot;"
+            android:autofillHints=""
+            android:hint="@string/search_hint"
             android:inputType="textWebEditText|text" />
+
+        <TextView
+            android:id="@+id/selectedCountTextView"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:visibility="visible" />
 
         <LinearLayout
             android:layout_width="wrap_content"
@@ -32,7 +41,7 @@
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="Search" />
+                android:text="@string/search" />
 
             <Space
                 android:layout_width="10dp"
@@ -44,7 +53,8 @@
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Clear" />
+                android:text="@string/clear" />
+
         </LinearLayout>
 
 
@@ -57,6 +67,8 @@
         android:scrollbars="vertical"
         app:layoutManager="GridLayoutManager"
         app:spanCount="3" />
+
+    <!-- New TextView to display the count of selected items -->
 
 
 </LinearLayout>

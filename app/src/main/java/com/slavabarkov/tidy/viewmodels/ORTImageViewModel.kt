@@ -64,7 +64,10 @@ class ORTImageViewModel(application: Application) : AndroidViewModel(application
                 while (it.moveToNext()) {
                     val id: Long = it.getLong(idColumn)
                     val date: Long = it.getLong(dateColumn)
-                    val bucket: String = it.getString(bucketColumn)
+                    val bucket: String = /*try {*/ it.getString(bucketColumn)
+                    /*} catch (e : Exception ) {
+                        continue
+                    }*/
                     // Don't add screenshots to image index
                     if (bucket == "Screenshots") continue
                     val record = repository.getRecord(id) as ImageEmbedding?
