@@ -4,13 +4,28 @@
 
 package com.slavabarkov.tidy.fragments
 
+import android.Manifest
+import android.content.ContentResolver
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresApi
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.recyclerview.selection.SelectionPredicates
@@ -24,12 +39,16 @@ import com.slavabarkov.tidy.viewmodels.SearchViewModel
 import com.slavabarkov.tidy.adapters.ImageAdapter
 import com.slavabarkov.tidy.adapters.ImageItemDetailsLookup
 import com.slavabarkov.tidy.adapters.ImageItemKeyProvider
-
+import java.io.File
+import android.provider.DocumentsContract
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 
 class SearchFragment : Fragment() {
     private var searchText: TextView? = null
     private var searchButton: Button? = null
     private var clearButton: Button? = null
+    private var moveButton: Button? = null
     private val mORTImageViewModel: ORTImageViewModel by activityViewModels()
     private val mORTTextViewModel: ORTTextViewModel by activityViewModels()
     private val mSearchViewModel: SearchViewModel by activityViewModels()
@@ -37,6 +56,49 @@ class SearchFragment : Fragment() {
     private lateinit var selectionTracker: SelectionTracker<Long>
     private lateinit var imageAdapter: ImageAdapter // Single instance
     private lateinit var recyclerView: RecyclerView
+
+
+
+    // Permission launcher for MANAGE_EXTERNAL_STORAGE
+    @RequiresApi(Build.VERSION_CODES.R)
+    // Permission launchers
+    private val storagePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+        Log.d("SearchFragment", "Storage permissions result: $permissions")
+        val readGranted = permissions[Manifest.permission.READ_EXTERNAL_STORAGE] == true
+        val writeGranted = permissions[Manifest.permission.WRITE_EXTERNAL_STORAGE] == true
+        Log.d("SearchFragment", "READ_EXTERNAL_STORAGE: $readGranted, WRITE_EXTERNAL_STORAGE: $writeGranted")
+        if (readGranted && writeGranted) {
+            Toast.makeText(context, "Storage permissions granted", Toast.LENGTH_SHORT).show()
+            moveButton?.isEnabled = true
+        } else {
+            Toast.makeText(context, "Storage permissions denied", Toast.LENGTH_LONG).show()
+            moveButton?.isEnabled = false
+        }
+    }
+
+    private val manageStorageLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        Log.d("SearchFragment", "Manage storage result: ${result.resultCode}")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
+            Toast.makeText(context, "Full storage access granted", Toast.LENGTH_SHORT).show()
+            moveButton?.isEnabled = true
+        } else {
+            Toast.makeText(context, "Full storage access denied", Toast.LENGTH_LONG).show()
+            moveButton?.isEnabled = false
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        requestFullStoragePermission()
+    }
+
+    // Folder picker launcher
+    @RequiresApi(Build.VERSION_CODES.R)
+    private val folderPickerLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        uri?.let { moveImagesToFolder(it) }
+    }
+
 
     override fun onResume() {
         super.onResume()
@@ -50,12 +112,15 @@ class SearchFragment : Fragment() {
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.R)
     override fun onCreateView(
         inflater: LayoutInflater, container: ViewGroup?,
         savedInstanceState: Bundle?,
     ): View? {
         val view = inflater.inflate(R.layout.fragment_search, container, false)
         recyclerView = view.findViewById<RecyclerView>(R.id.recycler_view)
+        moveButton = view.findViewById(R.id.moveButton)
+
         val selectedCountTextView = view.findViewById<TextView>(R.id.selectedCountTextView)
 
         if (mSearchViewModel.searchResults == null) {
@@ -85,6 +150,7 @@ class SearchFragment : Fragment() {
 //        }
 
         // Add selection observer
+        // Observe selection changes to show/hide Move button
         selectionTracker.addObserver(object : SelectionTracker.SelectionObserver<Long>() {
             override fun onSelectionChanged() {
                 super.onSelectionChanged()
@@ -94,7 +160,8 @@ class SearchFragment : Fragment() {
                     // Example: Show contextual action bar with delete/share options
                     //= actionMode = activity?.startActionMode(actionModeCallback)
                     // Show and update the TextView with the count
-                   selectedCountTextView.visibility = View.VISIBLE
+                    moveButton?.visibility = if (selectionTracker.hasSelection()) View.VISIBLE else View.GONE
+                    selectedCountTextView.visibility = View.VISIBLE
                    selectedCountTextView.text = "$selectedCount items selected"
                 } else {
                     // Hide action mode if no items are selected
@@ -142,8 +209,101 @@ class SearchFragment : Fragment() {
 //                recyclerView.layoutManager?.requestLayout()
 //            }
         }
+        // Initial permission check
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                Toast.makeText(context, "Full storage access required - redirecting to settings", Toast.LENGTH_LONG).show()
+                requestFullStoragePermission()
+            } else {
+                Log.d("SearchFragment", "Full storage access already granted")
+                moveButton?.isEnabled = true
+            }
+        } else {
+            if (!checkStoragePermissions()) {
+                Toast.makeText(context, "Storage permissions required", Toast.LENGTH_LONG).show()
+                requestStoragePermissions()
+            } else {
+                Log.d("SearchFragment", "Storage permissions already granted")
+                moveButton?.isEnabled = true
+            }
+        }
+
+        // Handle Move action
+        moveButton?.setOnClickListener {
+            Log.d("SearchFragment", "Move button clicked")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) { // Check for Android Q or higher
+                // Check permissions (MANAGE_EXTERNAL_STORAGE for R+, standard for Q)
+                if (hasStoragePermission()) {
+                    folderPickerLauncher.launch(null) // Launch folder picker for Q+
+                } else {
+                    // Request appropriate permission (MANAGE or standard READ/WRITE)
+                    requestAppropriateStoragePermissions()
+                    Toast.makeText(context, "Storage permission required", Toast.LENGTH_SHORT).show()
+                }
+            } else {
+                // Handle pre-Q devices: Show a message or implement a fallback strategy
+                Toast.makeText(context, "Move feature requires Android 10 or higher", Toast.LENGTH_LONG).show()
+            }
+        }
+
         return view
     }
+
+    private fun hasStoragePermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q) {
+            // On Q, we just need standard permissions usually granted via manifest or runtime request
+            checkStoragePermissions() // Reuse your existing check for READ/WRITE
+        } else {
+            // Below Q, this strategy isn't used, but keep check for completeness
+            checkStoragePermissions()
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun requestFullStoragePermission() {
+        Log.d("SearchFragment", "Requesting MANAGE_EXTERNAL_STORAGE")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+            manageStorageLauncher.launch(intent)
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun requestStoragePermissions() {
+        Log.d("SearchFragment", "Requesting READ/WRITE_EXTERNAL_STORAGE")
+        val permissions = arrayOf(
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE
+        )
+        storagePermissionLauncher.launch(permissions)
+    }
+    // You might want a single function to decide which permission flow to trigger
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun requestAppropriateStoragePermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            requestFullStoragePermission()
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // On Q, request standard READ/WRITE if not granted
+            if (!checkStoragePermissions()) {
+                requestStoragePermissions()
+            }
+        } else {
+            // Below Q - potentially request READ/WRITE if a fallback is ever implemented
+            if (!checkStoragePermissions()) {
+                requestStoragePermissions()
+            }
+        }
+    }
+
+    private fun checkStoragePermissions(): Boolean {
+        val readGranted = ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        val writeGranted = ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        Log.d("SearchFragment", "Checking permissions - READ: $readGranted, WRITE: $writeGranted")
+        return readGranted && writeGranted
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         // Save selection state
@@ -151,4 +311,188 @@ class SearchFragment : Fragment() {
             selectionTracker.onSaveInstanceState(outState)
         }
     }
+
+// Using ContentResolver.update with RELATIVE_PATH (Requires API 29+)
+    @RequiresApi(Build.VERSION_CODES.Q) // Mark function as requiring Q or higher
+    private fun moveImagesToFolder(folderUri: Uri) {
+        Log.d("SearchFragment", "moveImagesToFolder started (Strategy 1: Update RELATIVE_PATH)")
+        val selectedIds = selectionTracker.selection.toList()
+        if (selectedIds.isEmpty()) {
+            Log.d("SearchFragment", "No images selected for move.")
+            return
+        }
+
+        val contentResolver = requireContext().contentResolver
+        val movedIds = Collections.synchronizedList(mutableListOf<Long>()) // Keep thread-safe list
+        val completionCounter = AtomicInteger(selectedIds.size) // Keep completion counter
+
+        // **Crucial Step**: Get the relative path for MediaStore from the chosen folder URI
+        // This conversion can be complex and depends on where the user can pick folders.
+        // This is a placeholder - you'll need a robust way to implement getRelativePathFromTreeUri.
+        val targetRelativePath = getRelativePathFromTreeUri(requireContext(), folderUri)
+
+        if (targetRelativePath == null) {
+            Toast.makeText(context, "Could not determine a valid MediaStore path for the selected folder.", Toast.LENGTH_LONG).show()
+            Log.e("SearchFragment", "Failed to get relative path from folderUri: $folderUri")
+            return // Cannot proceed without a valid relative path
+        }
+
+        Log.d("SearchFragment", "Target MediaStore Relative Path: $targetRelativePath")
+
+        selectedIds.forEach { imageId ->
+            val sourceUri = Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, imageId.toString())
+            val values = ContentValues()
+
+            // Prepare the ContentValues for the update operation
+            values.put(MediaStore.MediaColumns.RELATIVE_PATH, targetRelativePath)
+            // Optional: If you want to rename the file during the move
+            // val originalDisplayName = getDisplayName(contentResolver, sourceUri) // Need a helper function for this
+            // if (originalDisplayName != null) {
+            //    values.put(MediaStore.MediaColumns.DISPLAY_NAME, "moved_$originalDisplayName")
+            // }
+
+            // IMPORTANT: On Android R (API 30) and later, MediaStore *might* automatically
+            // set IS_PENDING to 1 during the update. It *should* clear it upon success,
+            // but it's sometimes necessary to clear it manually *after* the update if issues arise.
+            // For simplicity, we'll rely on the system first. If metadata/visibility issues
+            // persist, a second update might be needed:
+            // val pendingValues = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+            // contentResolver.update(sourceUri, pendingValues, null, null) // Call after successful move
+
+            try {
+                // Perform the update
+                val updatedRows = contentResolver.update(sourceUri, values, null, null)
+
+                if (updatedRows > 0) {
+                    Log.d("SearchFragment", "Successfully updated RELATIVE_PATH for $sourceUri to $targetRelativePath")
+                    movedIds.add(imageId) // Mark as successfully moved
+                } else {
+                    Log.w("SearchFragment", "Failed to update RELATIVE_PATH for $sourceUri (rows updated: $updatedRows)")
+                    Toast.makeText(context, "Failed to move image ID: $imageId", Toast.LENGTH_SHORT).show()
+                }
+
+            } catch (securityException: SecurityException) {
+                // Handle potential SecurityExceptions, especially RecoverableSecurityException on R+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && securityException is android.app.RecoverableSecurityException) {
+                    Log.e("SearchFragment", "RecoverableSecurityException for $sourceUri", securityException)
+                    // You need an ActivityResultLauncher prepared to handle IntentSender requests
+                    // val intentSenderRequest = IntentSenderRequest.Builder(securityException.userAction.actionIntent.intentSender).build()
+                    // recoverableSecurityExceptionLauncher.launch(intentSenderRequest) // Launch the prompt
+                    // For now, just notify the user permission is needed. The move for this file failed.
+                    Toast.makeText(context, "Permission needed to move file $imageId", Toast.LENGTH_LONG).show()
+
+                } else {
+                    Log.e("SearchFragment", "SecurityException moving file $imageId via update", securityException)
+                    Toast.makeText(context, "Permission error moving file $imageId", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                // Catch other potential exceptions during the update
+                Log.e("SearchFragment", "Error moving file $imageId via update", e)
+                Toast.makeText(context, "Error moving file $imageId", Toast.LENGTH_SHORT).show()
+            } finally {
+                // Decrement counter regardless of success/failure for this file
+                // and check if all operations are done to update UI
+                if (completionCounter.decrementAndGet() == 0) {
+                    activity?.runOnUiThread { finalizeMove(movedIds) }
+                }
+            }
+        } // End of forEach loop
+
+        // Initial check in case the list was empty or path was invalid
+        if (selectedIds.isEmpty() || targetRelativePath == null) {
+            finalizeMove(movedIds) // Update UI even if nothing was processed
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q) // Keep the API level requirement
+    private fun getRelativePathFromTreeUri(context: Context, treeUri: Uri): String? {
+        // Check if it's a tree URI
+        if (!DocumentsContract.isTreeUri(treeUri)) {
+            Log.e("getRelativePath", "Uri is not a tree URI: $treeUri")
+            return null
+        }
+
+        // Get the document ID from the tree URI
+        val documentId = DocumentsContract.getTreeDocumentId(treeUri) ?: return null
+        // Example documentId: "primary:Pictures/MyFolder" or "1234-5678:DCIM/Vacation"
+
+        val parts = documentId.split(":", limit = 2)
+        if (parts.size != 2) {
+            Log.e("getRelativePath", "Could not split document ID: $documentId")
+            return null // Unexpected format
+        }
+
+        val type = parts[0] // e.g., "primary" or "1234-5678" (volume identifier)
+        val path = parts[1] // e.g., "Pictures/MyFolder" or "DCIM/Vacation"
+
+        Log.d("getRelativePath", "Extracted Path: $path from Document ID: $documentId")
+
+        // Validate if the path starts with a standard public directory MediaStore recognizes well.
+        // This is crucial because RELATIVE_PATH works best with these.
+        val standardDirs = listOf(
+            Environment.DIRECTORY_PICTURES,
+            Environment.DIRECTORY_DCIM,
+            Environment.DIRECTORY_MOVIES,
+            Environment.DIRECTORY_MUSIC,
+            Environment.DIRECTORY_DOWNLOADS,
+            Environment.DIRECTORY_DOCUMENTS
+            // Add others if needed
+        )
+
+        var isValidPrefix = false
+        for (dir in standardDirs) {
+            if (path.startsWith(dir, ignoreCase = true)) {
+                isValidPrefix = true
+                break
+            }
+        }
+
+        if (!isValidPrefix) {
+            // If the selected folder is not inside a standard directory (e.g., root of SD card),
+            // using RELATIVE_PATH might be problematic or not work as expected.
+            // You might need a different strategy or restrict folder selection.
+            Log.w("getRelativePath", "Path '$path' does not start with a standard MediaStore directory.")
+            // Returning null here enforces moving only to standard locations.
+            // Alternatively, you could try returning just the path, but it might fail.
+            return null
+        }
+
+        // Ensure the path ends with a forward slash '/' as required by RELATIVE_PATH
+        return if (path.endsWith(File.separator)) {
+            path
+        } else {
+            "$path/"
+        }
+        // Example valid return values: "Pictures/MyFolder/", "DCIM/Vacation/"
+    }
+
+    private fun finalizeMove(movedIds: List<Long>) {
+        Log.d("SearchFragment", "Finalizing move operation. Moved count: ${movedIds.size}")
+        val currentDataset = imageAdapter.getDataset()
+        val newDataset = currentDataset.filter { !movedIds.contains(it) }
+        imageAdapter.updateData(newDataset)
+        selectionTracker.clearSelection()
+        if (movedIds.isNotEmpty()) { // Only show toast if something was actually moved
+            Toast.makeText(context, "${movedIds.size} images moved", Toast.LENGTH_SHORT).show()
+        }
+        // Hide progress indicator if any
+    }
+
+
+    // Optional Helper: You might need this if renaming files
+    private fun getDisplayName(contentResolver: ContentResolver, uri: Uri): String? {
+        var displayName: String? = null
+        try {
+            contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    displayName = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("SearchFragment", "Error getting display name for $uri", e)
+        }
+        return displayName
+    }
+
+
 }

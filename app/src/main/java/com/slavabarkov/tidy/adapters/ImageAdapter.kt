@@ -38,6 +38,8 @@ class ImageAdapter(private val context: Context, initialDataset: List<Long>) :
         notifyDataSetChanged()
     }
 
+    fun getDataset(): List<Long> = dataset // Add this to access dataset
+
     class ImageViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val imageView: ImageView = view.findViewById(R.id.item_image)
         val checkBox: CheckBox = view.findViewById(R.id.imageCheckbox)
