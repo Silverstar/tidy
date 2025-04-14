@@ -13,6 +13,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.MediaStore
+import android.util.Log
 import androidx.lifecycle.*
 import com.slavabarkov.tidy.R
 import com.slavabarkov.tidy.centerCrop
@@ -116,6 +117,63 @@ class ORTImageViewModel(application: Application) : AndroidViewModel(application
             cursor?.close()
             session.close()
             progress.setValue(1.0)
+        }
+    }
+
+    private fun removeItemsFromIndex(idsToRemove: List<Long>) {
+        Log.d("ORTImageViewModel", "Removing ${idsToRemove.size} items from index data.")
+
+        // Use sets for efficient contains checks
+        val idsToRemoveSet = idsToRemove.toSet()
+
+        // Create new lists to hold the data we want to keep
+        val newIdxList = ArrayList<Long>()
+        val newEmbeddingsList = ArrayList<FloatArray>()
+
+        // Iterate through the *original* lists, and only add items *not* in the removal set
+        for (i in idxList.indices) {
+            val currentId = idxList[i]
+            if (!idsToRemoveSet.contains(currentId)) {
+                newIdxList.add(currentId)
+                // Ensure embeddingsList is at least as long as idxList
+                if (i < embeddingsList.size) {
+                    newEmbeddingsList.add(embeddingsList[i])
+                }
+                else{
+                    Log.e("ORTImageViewModel", "embeddingsList is shorter than idxList at index $i, id: $currentId")
+                }
+            }
+        }
+
+        // Replace the old lists with the filtered ones.
+        idxList = newIdxList
+        embeddingsList = newEmbeddingsList
+
+        // Also remove from the ID-to-Name map if you are using it.
+        //idToNameMap.keys.removeAll(idsToRemoveSet)
+
+        Log.d("ORTImageViewModel", "Index data updated. New size: ${idxList.size}")
+    }
+
+    // Add this function to handle the database deletion and call removeItemsFromIndex
+    fun handleSuccessfulDeletions(successfullyDeletedIds: List<Long>) {
+        viewModelScope.launch(Dispatchers.IO) { // Use IO dispatcher for DB
+            // Delete from the Room database using the Repository
+            repository.deleteMultipleRecords(successfullyDeletedIds)
+            Log.d("ORTImageViewModel", "Deleted ${successfullyDeletedIds.size} records from database")
+
+            // Update the in-memory data *after* the database operation
+            launch(Dispatchers.Main) { // Switch back to Main thread for UI-related updates
+                removeItemsFromIndex(successfullyDeletedIds) // Call the function above
+                // Notify the Fragment (e.g., using LiveData or StateFlow) that the data has changed.
+                //  You'll need to define a LiveData or StateFlow for this purpose in ORTImageViewModel
+                //  and observe it in the fragment.  For simplicity, I'll omit that part here,
+                //  but it's the proper way to communicate the change.
+                //  Example (add to ORTImageViewModel):
+                //  val deletionFinished = MutableSharedFlow<Unit>() //  Use SharedFlow
+                //  and then in this function:  deletionFinished.emit(Unit)
+                //  The fragment would then collect this SharedFlow.
+            }
         }
     }
 }

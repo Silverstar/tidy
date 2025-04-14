@@ -61,18 +61,18 @@
     </LinearLayout>
 
     <LinearLayout
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:gravity="center"
         android:orientation="horizontal">
 
         <Button
             android:id="@+id/deleteButton"
-            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            style="@style/Widget.MaterialComponents.Button"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Delete"
-            tools:visibility="gone" />
+            android:text="@string/delete"
+            android:visibility="visible" />
 
         <Space
             android:layout_width="10dp"
@@ -80,11 +80,11 @@
 
         <Button
             android:id="@+id/moveButton"
-            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            style="@style/Widget.MaterialComponents.Button"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Move"
-            android:visibility="gone"/>
+            android:text="@string/move"
+            android:visibility="visible" />
     </LinearLayout>
 
     <androidx.recyclerview.widget.RecyclerView

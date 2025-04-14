@@ -5,10 +5,14 @@
 package com.slavabarkov.tidy.fragments
 
 import android.Manifest
+import android.app.Activity
+import android.app.RecoverableSecurityException
 import android.content.ContentResolver
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentSender
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -41,8 +45,14 @@ import com.slavabarkov.tidy.adapters.ImageItemDetailsLookup
 import com.slavabarkov.tidy.adapters.ImageItemKeyProvider
 import java.io.File
 import android.provider.DocumentsContract
+import androidx.activity.result.IntentSenderRequest
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import androidx.activity.result.ActivityResultLauncher
+import androidx.appcompat.app.AlertDialog
 
 class SearchFragment : Fragment() {
     private var searchText: TextView? = null
@@ -56,8 +66,9 @@ class SearchFragment : Fragment() {
     private lateinit var selectionTracker: SelectionTracker<Long>
     private lateinit var imageAdapter: ImageAdapter // Single instance
     private lateinit var recyclerView: RecyclerView
-
-
+    private lateinit var deleteResultLauncher: ActivityResultLauncher<IntentSenderRequest>
+    private lateinit var deleteButton: Button
+    private var pendingDeleteIds: List<Long>? = null
 
     // Permission launcher for MANAGE_EXTERNAL_STORAGE
     @RequiresApi(Build.VERSION_CODES.R)
@@ -91,6 +102,32 @@ class SearchFragment : Fragment() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestFullStoragePermission()
+        deleteResultLauncher = registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+            val idsSuccessfullyProcessed = pendingDeleteIds // Get the IDs we were working on
+            pendingDeleteIds = null // Clear the temporary list immediately
+            if (result.resultCode == Activity.RESULT_OK) {
+                Log.d("SearchFragment", "Delete permission granted via IntentSender.")
+                // Check if we have IDs stored (meaning this likely came from API 30+ createTrashRequest or API 29 Recoverable)
+                if (!idsSuccessfullyProcessed.isNullOrEmpty()) {
+                    // Assume the operation succeeded for the requested IDs (either trashed on 30+ or permission granted on 29)
+                    // Call handleSuccessfulDeletion to update DB, ViewModel state, and UI
+                    Log.d("SearchFragment", "Processing successful deletion/trashing for IDs: $idsSuccessfullyProcessed")
+                    handleSuccessfulDeletion(idsSuccessfullyProcessed, emptyList()) // Pass empty list for failures here
+                } else {
+                    // This case might happen if pendingDeleteIds was null (unexpected) or empty
+                    // Or potentially after an API 29 RecoverableSecurityException where we only prompted for one item.
+                    // You might just show a generic success/refresh message or specific logic for API 29 retry.
+                    Log.w(
+                        "SearchFragment",
+                        "RESULT_OK received, but no pending IDs found or specific retry logic needed."
+                    )
+                }
+                Toast.makeText(context, "Permission granted. Please try deleting again.", Toast.LENGTH_SHORT).show()
+            } else {
+                Log.w("SearchFragment", "Delete permission denied.")
+                Toast.makeText(context, "Deletion cancelled.", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     // Folder picker launcher
@@ -120,6 +157,7 @@ class SearchFragment : Fragment() {
         val view = inflater.inflate(R.layout.fragment_search, container, false)
         recyclerView = view.findViewById<RecyclerView>(R.id.recycler_view)
         moveButton = view.findViewById(R.id.moveButton)
+        deleteButton = view.findViewById(R.id.deleteButton)  // Get the delete button
 
         val selectedCountTextView = view.findViewById<TextView>(R.id.selectedCountTextView)
 
@@ -154,6 +192,7 @@ class SearchFragment : Fragment() {
         selectionTracker.addObserver(object : SelectionTracker.SelectionObserver<Long>() {
             override fun onSelectionChanged() {
                 super.onSelectionChanged()
+                val hasSelection = selectionTracker.hasSelection()
                 val selectedCount = selectionTracker.selection.size()
                 // Handle selection changes (show ActionMode, etc.)
                 if (selectedCount > 0) {
@@ -161,6 +200,10 @@ class SearchFragment : Fragment() {
                     //= actionMode = activity?.startActionMode(actionModeCallback)
                     // Show and update the TextView with the count
                     moveButton?.visibility = if (selectionTracker.hasSelection()) View.VISIBLE else View.GONE
+                    // Ensure deleteButton reference is not null before accessing visibility
+                    if(::deleteButton.isInitialized) {
+                        deleteButton.visibility = if (hasSelection) View.VISIBLE else View.GONE // Make Delete button visible
+                    }
                     selectedCountTextView.visibility = View.VISIBLE
                    selectedCountTextView.text = "$selectedCount items selected"
                 } else {
@@ -204,7 +247,10 @@ class SearchFragment : Fragment() {
             searchText?.text = null
             mSearchViewModel.searchResults = mORTImageViewModel.idxList.reversed()
             imageAdapter.updateData(mSearchViewModel.searchResults!!)
-           // Refresh RecyclerView layout to ensure proper binding
+            moveButton?.visibility = View.GONE;
+            deleteButton.visibility = View.GONE;
+
+            // Refresh RecyclerView layout to ensure proper binding
 //            recyclerView.post {
 //                recyclerView.layoutManager?.requestLayout()
 //            }
@@ -244,6 +290,17 @@ class SearchFragment : Fragment() {
                 // Handle pre-Q devices: Show a message or implement a fallback strategy
                 Toast.makeText(context, "Move feature requires Android 10 or higher", Toast.LENGTH_LONG).show()
             }
+        }
+
+        // *** Set Delete Button Click Listener ***
+        deleteButton.setOnClickListener {
+            val selectedIds = selectionTracker.selection.toList()
+            if (selectedIds.isEmpty()) {
+                Toast.makeText(context, "No images selected", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            //show confirmation dialog
+            showDeleteConfirmationDialog(selectedIds)
         }
 
         return view
@@ -493,6 +550,177 @@ class SearchFragment : Fragment() {
         }
         return displayName
     }
+    // Show alert dialog before deletion
+    private fun showDeleteConfirmationDialog(selectedIds: List<Long>) {
+        val itemCount = selectedIds.size
+        // Determine message based on API level (Trash vs. Permanent)
+        val message = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            "Are you sure you want to move $itemCount selected image(s) to the trash?" // API 30+ message
+        } else {
+            "Are you sure you want to permanently delete $itemCount selected image(s)? This action cannot be undone." // Pre-API 30 message
+        }
+
+        // Use MaterialAlertDialogBuilder if using Material Components theme (recommended)
+        AlertDialog.Builder(requireContext())
+            .setTitle("Confirm Deletion")
+            .setMessage(message)
+            .setPositiveButton("Delete") { dialog, which ->
+                // User clicked DELETE - now proceed with the actual deletion
+                Log.d("SearchFragment", "User confirmed deletion for $itemCount items.")
+                initiateMediaStoreDeletion(selectedIds) // Call the function that starts the deletion process
+            }
+            .setNegativeButton("Cancel") { dialog, which ->
+                // User clicked Cancel - do nothing, just dismiss dialog
+                Log.d("SearchFragment", "User cancelled deletion.")
+                dialog.dismiss()
+            }
+            .show() // Display the dialog
+    }
+
+    private fun initiateMediaStoreDeletion(selectedIds: List<Long>) {
+        if (selectedIds.isEmpty()) return // Should be checked before calling, but good practice
+
+        val contentResolver = requireContext().contentResolver
+        val urisToDelete = selectedIds.map { id ->
+            ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+        }
+
+        // --- Choose method based on API level ---
+        when {
+            // --- API 30+ (Android 11+): Use createTrashRequest ---
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                try {
+                    // Request to move files to trash (setTrashedState = true)
+                    val pendingIntent = MediaStore.createTrashRequest(contentResolver, urisToDelete, true)
+                    val intentSenderRequest = IntentSenderRequest.Builder(pendingIntent).build()
+
+                    // *** Store the IDs before launching the request ***
+                    pendingDeleteIds = selectedIds
+
+                    // Launch the system dialog using the *same* launcher used for recoverable exceptions
+                    Log.d("SearchFragment", "Launching createTrashRequest for ${urisToDelete.size} items.")
+                    deleteResultLauncher.launch(intentSenderRequest)
+                    // The actual DB/UI update will happen in the launcher's result callback IF RESULT_OK
+                } catch (e: Exception) {
+                    Log.e("SearchFragment", "Error creating or launching trash request", e)
+                    Toast.makeText(context, "Failed to initiate trashing operation.", Toast.LENGTH_SHORT).show()
+                    pendingDeleteIds = null // Clear pending IDs on immediate failure
+                }
+            }
+
+            // --- API 29 (Android 10): Use delete() + RecoverableSecurityException ---
+            Build.VERSION.SDK_INT == Build.VERSION_CODES.Q -> {
+                // Store IDs before starting loop
+                pendingDeleteIds = selectedIds
+                lifecycleScope.launch(Dispatchers.IO) {
+                    handleDeletionLoop(selectedIds, urisToDelete)
+                }
+            }
+
+            // --- API 28 and below: Use delete() (Permanent) ---
+            else -> { // Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+                lifecycleScope.launch(Dispatchers.IO) {
+                    handleDeletionLoop(selectedIds, urisToDelete)
+                }
+            }
+        }
+    }
+    // Helper function for the deletion loop used by API 29 and below
+    // (Moved the loop logic here for clarity)
+    private suspend fun handleDeletionLoop(selectedIds: List<Long>, urisToDelete: List<Uri>) {
+        val contentResolver = requireContext().contentResolver
+        val successfullyDeletedIds = mutableListOf<Long>()
+        val failedIds = mutableListOf<Long>()
+        var requiresPermission = false
+
+        for (i in urisToDelete.indices) {
+            val imageUri = urisToDelete[i]
+            val imageId = selectedIds[i] // Assumes lists are aligned
+
+            try {
+                val deletedRows = contentResolver.delete(imageUri, null, null)
+                if (deletedRows > 0) {
+                    Log.d("SearchFragment", "Successfully deleted MediaStore (API < 30) ID: $imageId")
+                    successfullyDeletedIds.add(imageId)
+                } else {
+                    Log.w("SearchFragment", "Failed to delete MediaStore (API < 30) ID: $imageId")
+                    failedIds.add(imageId)
+                }
+            } catch (securityException: SecurityException) {
+                // Only handle RecoverableSecurityException on Q (API 29)
+                if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && securityException is RecoverableSecurityException) {
+                    requiresPermission = true
+                    try {
+                        val intentSenderRequest = IntentSenderRequest.Builder(securityException.userAction.actionIntent.intentSender).build()
+                        // *** Store the *single* ID needing permission (overwrites batch IDs) ***
+                        // Note: This simplistic approach only handles one permission request at a time.
+                        // If multiple files need permission, only the first one will be prompted for.
+                        pendingDeleteIds = listOf(imageId) // Store only the ID causing the exception
+                        Log.d("SearchFragment","RecoverableSecurityException for ID $imageId, launching prompt.")
+                        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.Main) { // Must launch on Main thread
+                            deleteResultLauncher.launch(intentSenderRequest)
+                        }
+                        break
+                    } catch (e: IntentSender.SendIntentException) {
+                        Log.e("SearchFragment", "Failed to launch delete intent sender (API 29) for ID: $imageId", e)
+                        failedIds.add(imageId)
+                        pendingDeleteIds = null // Clear pending IDs on launch failure
+                    }
+                } else {
+                    // Non-recoverable or pre-Q security exception (likely missing WRITE_EXTERNAL_STORAGE)
+                    Log.e("SearchFragment", "SecurityException (non-recoverable or API < 29) deleting ID: $imageId", securityException)
+                    failedIds.add(imageId)
+                }
+            } catch (e: Exception) {
+                Log.e("SearchFragment", "Error deleting ID: $imageId", e)
+                failedIds.add(imageId)
+            }
+        } // End loop
+
+        // If we completed the loop without needing permission, finalize the successful deletions
+        if (!requiresPermission) {
+            pendingDeleteIds = null // Clear pending IDs as the batch completed normally
+            handleSuccessfulDeletion(successfullyDeletedIds, failedIds)
+        }
+    }
+
+    private fun handleSuccessfulDeletion(successfullyDeletedIds: List<Long>, failedIds: List<Long>){
+        // After (successful) MediaStore deletions, notify ViewModel and update UI
+        if (successfullyDeletedIds.isNotEmpty()) {
+            // Call the ViewModel function (on IO thread)
+            mORTImageViewModel.handleSuccessfulDeletions(successfullyDeletedIds)
+
+            // Update UI on the main thread (using viewLifecycleOwner)
+            viewLifecycleOwner.lifecycleScope.launch(Dispatchers.Main) {
+                // mSearchViewModel.searchResults should be updated by the view model.
+                Log.d("SearchFragment", "Updating UI directly after deletion request.")
+
+                // Get the currently displayed list (might be search results or full list)
+                val currentDisplayedList = mSearchViewModel.searchResults ?: mORTImageViewModel.idxList.reversed() // Or however you get the default list
+
+                // Create the new list for the adapter by filtering out deleted items
+                val newListForAdapter = currentDisplayedList.filter { it !in successfullyDeletedIds }
+
+                // Update the SearchViewModel's cache as well (important!)
+                mSearchViewModel.searchResults = newListForAdapter
+
+
+                imageAdapter.updateData(newListForAdapter)  // Use emptyList() as a safe default
+
+                selectionTracker.clearSelection()
+
+                Toast.makeText(context, "${successfullyDeletedIds.size} images deleted", Toast.LENGTH_SHORT).show()
+            }
+        }
+        if(failedIds.isNotEmpty()){
+            viewLifecycleOwner.lifecycleScope.launch(Dispatchers.Main){
+                Toast.makeText(context, "${failedIds.size} images failed to delete", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+
+
 
 
 }

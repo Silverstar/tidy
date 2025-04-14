@@ -16,4 +16,7 @@ interface ImageEmbeddingDao {
 
     @Query("SELECT * FROM image_embeddings WHERE id = :id LIMIT 1")
     suspend fun getRecord(id: Long): ImageEmbedding
+
+    @Query("DELETE FROM image_embeddings WHERE id IN (:ids)")
+    suspend fun deleteMultipleRecords(ids: List<Long>)
 }
