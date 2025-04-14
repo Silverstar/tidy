@@ -3,4 +3,6 @@
     <string name="search_hint">Black dog sitting on a table</string>
     <string name="search">search</string>
     <string name="clear">Clear</string>
+    <string name="delete">Delete</string>
+    <string name="move">Move</string>
 </resources>
