@@ -69,7 +69,7 @@ class SearchFragment : Fragment() {
     private lateinit var deleteResultLauncher: ActivityResultLauncher<IntentSenderRequest>
     private lateinit var deleteButton: Button
     private var pendingDeleteIds: List<Long>? = null
-
+    private var selectedCountTextView: TextView? = null
     // Permission launcher for MANAGE_EXTERNAL_STORAGE
     @RequiresApi(Build.VERSION_CODES.R)
     // Permission launchers
@@ -154,20 +154,34 @@ class SearchFragment : Fragment() {
         inflater: LayoutInflater, container: ViewGroup?,
         savedInstanceState: Bundle?,
     ): View? {
+        // INITIALIZE VIEWS
         val view = inflater.inflate(R.layout.fragment_search, container, false)
         recyclerView = view.findViewById<RecyclerView>(R.id.recycler_view)
+        searchText = view?.findViewById(R.id.searchText)
+        searchButton = view?.findViewById(R.id.searchButton)
         moveButton = view.findViewById(R.id.moveButton)
         deleteButton = view.findViewById(R.id.deleteButton)  // Get the delete button
-
-        val selectedCountTextView = view.findViewById<TextView>(R.id.selectedCountTextView)
+        clearButton = view?.findViewById(R.id.clearButton)
+        selectedCountTextView = view.findViewById<TextView>(R.id.selectedCountTextView)
 
         if (mSearchViewModel.searchResults == null) {
             mSearchViewModel.searchResults = mORTImageViewModel.idxList.reversed()
         }
+        //STEP 1 ADAPTER CREATION
         imageAdapter =  ImageAdapter(requireContext(), emptyList())
         recyclerView.adapter = imageAdapter
         recyclerView.scrollToPosition(0)
 
+        //STEP:2 Prepare & Set Adapter Data
+        // Set initial data
+        if (mSearchViewModel.searchResults == null) {
+            Log.d("SelectionState", "onCreateView START. searchResults is null? ${mSearchViewModel.searchResults == null}. idxList size: ${mORTImageViewModel.idxList.size}")
+            mSearchViewModel.searchResults = mORTImageViewModel.idxList.reversed()
+            Log.d("SelectionState", "onCreateView: initialData SET. Size: ${mSearchViewModel.searchResults!!.size}")
+        }
+
+
+        //STEP 3
         // Initialize Selection Tracker
         selectionTracker = SelectionTracker.Builder(
             "search-image-selection",
@@ -182,98 +196,74 @@ class SearchFragment : Fragment() {
         // Pass the selection tracker to the adapter
         imageAdapter.selectionTracker = selectionTracker
 
-        // Restore selection state if available
-//        savedInstanceState?.let {
-//            selectionTracker.onRestoreInstanceState(it)
-//        }
-
-        // Add selection observer
-        // Observe selection changes to show/hide Move button
-        selectionTracker.addObserver(object : SelectionTracker.SelectionObserver<Long>() {
-            override fun onSelectionChanged() {
-                super.onSelectionChanged()
-                val hasSelection = selectionTracker.hasSelection()
-                val selectedCount = selectionTracker.selection.size()
-                // Handle selection changes (show ActionMode, etc.)
-                if (selectedCount > 0) {
-                    // Example: Show contextual action bar with delete/share options
-                    //= actionMode = activity?.startActionMode(actionModeCallback)
-                    // Show and update the TextView with the count
-                    moveButton?.visibility = if (selectionTracker.hasSelection()) View.VISIBLE else View.GONE
-                    // Ensure deleteButton reference is not null before accessing visibility
-                    if(::deleteButton.isInitialized) {
-                        deleteButton.visibility = if (hasSelection) View.VISIBLE else View.GONE // Make Delete button visible
-                    }
-                    selectedCountTextView.visibility = View.VISIBLE
-                   selectedCountTextView.text = "$selectedCount items selected"
-                } else {
-                    // Hide action mode if no items are selected
-                    // actionMode?.finish()
-                    // Hide the TextView when no items are selected
-                    selectedCountTextView.visibility = View.GONE
-                }
-            }
-        })
-
+        //--- Setup listeners that DON'T depend on restored state ---
         mORTTextViewModel.init()
-
-        searchText = view?.findViewById(R.id.searchText)
-        searchButton = view?.findViewById(R.id.searchButton)
-
-        // Set initial data
-        if (mSearchViewModel.searchResults == null) {
-            mSearchViewModel.searchResults = mORTImageViewModel.idxList.reversed()
-        }
         imageAdapter.updateData(mSearchViewModel.searchResults!!)
 
         searchButton?.setOnClickListener {
             val textEmbedding: FloatArray =
                 mORTTextViewModel.getTextEmbedding(searchText?.text.toString())
             mSearchViewModel.sortByCosineDistance(textEmbedding, mORTImageViewModel.embeddingsList, mORTImageViewModel.idxList)
-
+            if(::selectionTracker.isInitialized) selectionTracker.clearSelection()
+            mSearchViewModel.clearSavedSelection()
             imageAdapter.updateData(mSearchViewModel.searchResults!!)
-
-            // Refresh RecyclerView layout to ensure proper binding
-//            recyclerView.post {
-//                recyclerView.layoutManager?.requestLayout()
-//            }
-
             Log.d("SelectionInfo", selectionTracker.hasSelection().toString())
-
         }
 
-        clearButton = view?.findViewById(R.id.clearButton)
+
         clearButton?.setOnClickListener{
             searchText?.text = null
             mSearchViewModel.searchResults = mORTImageViewModel.idxList.reversed()
             imageAdapter.updateData(mSearchViewModel.searchResults!!)
-            moveButton?.visibility = View.GONE;
-            deleteButton.visibility = View.GONE;
-
-            // Refresh RecyclerView layout to ensure proper binding
-//            recyclerView.post {
-//                recyclerView.layoutManager?.requestLayout()
-//            }
+            moveButton?.visibility = View.GONE
+            deleteButton.visibility = View.GONE
+            if(::selectionTracker.isInitialized) selectionTracker.clearSelection()
+            mSearchViewModel.clearSavedSelection()
+            imageAdapter.updateData(mSearchViewModel.searchResults ?: emptyList())
+            recyclerView.scrollToPosition(0)
         }
-        // Initial permission check
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (!Environment.isExternalStorageManager()) {
-                Toast.makeText(context, "Full storage access required - redirecting to settings", Toast.LENGTH_LONG).show()
-                requestFullStoragePermission()
-            } else {
-                Log.d("SearchFragment", "Full storage access already granted")
-                moveButton?.isEnabled = true
+
+        // Permission checks (can often happen here or onViewCreated)
+        setupPermissionChecksAndButtons()
+
+        return view
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        Log.d("LifecycleDebug", "onViewCreated called")
+
+        // --- STEP 4: Restore Tracker State ---
+        // (Do this in onViewCreated after the view hierarchy is ready)
+        val savedSelection = mSearchViewModel.selectedItemIds.value
+        if (!savedSelection.isNullOrEmpty()) {
+            Log.d("SelectionState", "Attempting to restore selection from ViewModel. Count: ${savedSelection.size}")
+            // Use try-catch as setItemsSelected can potentially fail
+            try {
+                if (::selectionTracker.isInitialized) { // Ensure tracker exists
+                    selectionTracker.setItemsSelected(savedSelection, true)
+                    Log.d("SelectionState", "Restored from ViewModel. Has Selection NOW: ${selectionTracker.hasSelection()}, Count: ${selectionTracker.selection.size()}")
+                } else {
+                    Log.e("SelectionState", "Cannot restore from ViewModel, tracker not initialized.")
+                }
+            } catch (e: Exception) {
+                Log.e("SelectionState", "Error restoring selection from ViewModel", e)
+                if (::selectionTracker.isInitialized) selectionTracker.clearSelection() // Clear if restore fails
             }
         } else {
-            if (!checkStoragePermissions()) {
-                Toast.makeText(context, "Storage permissions required", Toast.LENGTH_LONG).show()
-                requestStoragePermissions()
-            } else {
-                Log.d("SearchFragment", "Storage permissions already granted")
-                moveButton?.isEnabled = true
-            }
+            Log.d("SelectionState", "No selection found in ViewModel to restore.")
         }
 
+        // --- STEP 5: Update UI based on potentially restored state ---
+        updateSelectionUi()
+        Log.d("SelectionState", "Initial UI update in onViewCreated complete.")
+
+        // --- STEP 6: Add Selection Observer ---
+        // (Add observer after potential state restoration)
+        addSelectionObserver()
+
+        // --- Setup listeners that might depend on tracker state / UI elements ---
         // Handle Move action
         moveButton?.setOnClickListener {
             Log.d("SearchFragment", "Move button clicked")
@@ -303,7 +293,8 @@ class SearchFragment : Fragment() {
             showDeleteConfirmationDialog(selectedIds)
         }
 
-        return view
+
+        Log.d("LifecycleDebug", "onViewCreated finished")
     }
 
     private fun hasStoragePermission(): Boolean {
@@ -336,7 +327,7 @@ class SearchFragment : Fragment() {
         )
         storagePermissionLauncher.launch(permissions)
     }
-    // You might want a single function to decide which permission flow to trigger
+
     @RequiresApi(Build.VERSION_CODES.R)
     private fun requestAppropriateStoragePermissions() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -361,13 +352,6 @@ class SearchFragment : Fragment() {
         return readGranted && writeGranted
     }
 
-    override fun onSaveInstanceState(outState: Bundle) {
-        super.onSaveInstanceState(outState)
-        // Save selection state
-        if (::selectionTracker.isInitialized) {
-            selectionTracker.onSaveInstanceState(outState)
-        }
-    }
 
 // Using ContentResolver.update with RELATIVE_PATH (Requires API 29+)
     @RequiresApi(Build.VERSION_CODES.Q) // Mark function as requiring Q or higher
@@ -430,7 +414,7 @@ class SearchFragment : Fragment() {
 
             } catch (securityException: SecurityException) {
                 // Handle potential SecurityExceptions, especially RecoverableSecurityException on R+
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && securityException is android.app.RecoverableSecurityException) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && securityException is RecoverableSecurityException) {
                     Log.e("SearchFragment", "RecoverableSecurityException for $sourceUri", securityException)
                     // You need an ActivityResultLauncher prepared to handle IntentSender requests
                     // val intentSenderRequest = IntentSenderRequest.Builder(securityException.userAction.actionIntent.intentSender).build()
@@ -719,7 +703,61 @@ class SearchFragment : Fragment() {
         }
     }
 
+    private fun addSelectionObserver() {
+        if (!::selectionTracker.isInitialized) return
+        selectionTracker.addObserver(object : SelectionTracker.SelectionObserver<Long>() {
+            override fun onSelectionChanged() {
+                super.onSelectionChanged()
+                Log.d("SelectionState", "Observer onSelectionChanged triggered.")
+                // *** SAVE current selection to ViewModel ***
+                mSearchViewModel.saveSelection(selectionTracker.selection.map { it }.toSet())
+                // Update UI based on the NEW selection state
+                updateSelectionUi()
+            }
+        })
+        Log.d("SelectionState", "Selection observer added.")
+    }
 
+    private fun updateSelectionUi() {
+        if (!::selectionTracker.isInitialized) return // Safety check
+
+        val selectedCount = selectionTracker.selection.size()
+        val hasSelection = selectedCount > 0
+
+        Log.d("SelectionUI", "Updating UI. Count: $selectedCount, HasSelection: $hasSelection")
+
+        // Use safe calls (?.) in case views aren't ready yet, though they should be in onViewCreated
+        moveButton?.visibility = if (hasSelection) View.VISIBLE else View.GONE
+        deleteButton.visibility = if (hasSelection) View.VISIBLE else View.GONE
+        selectedCountTextView?.visibility = if (hasSelection) View.VISIBLE else View.GONE
+        if (hasSelection) {
+            selectedCountTextView?.text = "$selectedCount items selected"
+        }else {
+            selectedCountTextView?.visibility = View.GONE
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun setupPermissionChecksAndButtons() {
+        // Initial permission check
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                Toast.makeText(context, "Full storage access required - redirecting to settings", Toast.LENGTH_LONG).show()
+                requestFullStoragePermission()
+            } else {
+                Log.d("SearchFragment", "Full storage access already granted")
+                moveButton?.isEnabled = true
+            }
+        } else {
+            if (!checkStoragePermissions()) {
+                Toast.makeText(context, "Storage permissions required", Toast.LENGTH_LONG).show()
+                requestStoragePermissions()
+            } else {
+                Log.d("SearchFragment", "Storage permissions already granted")
+                moveButton?.isEnabled = true
+            }
+        }
+    }
 
 
 

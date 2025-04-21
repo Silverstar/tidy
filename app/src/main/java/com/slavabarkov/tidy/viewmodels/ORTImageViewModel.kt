@@ -60,17 +60,14 @@ class ORTImageViewModel(application: Application) : AndroidViewModel(application
                 val idColumn: Int = it.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
                 val dateColumn: Int =
                     it.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
-                val bucketColumn: Int =
-                    it.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
+                //val bucketColumn: Int =
+                  //  it.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
                 while (it.moveToNext()) {
                     val id: Long = it.getLong(idColumn)
                     val date: Long = it.getLong(dateColumn)
-                    val bucket: String = /*try {*/ it.getString(bucketColumn)
-                    /*} catch (e : Exception ) {
-                        continue
-                    }*/
+                   // val bucket: String = /*try {*/ it.getString(bucketColumn)
                     // Don't add screenshots to image index
-                    if (bucket == "Screenshots") continue
+                    //if (bucket == "Screenshots") continue
                     val record = repository.getRecord(id) as ImageEmbedding?
                     if (record != null) {
                         idxList.add(record.id)

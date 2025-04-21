@@ -4,4 +4,5 @@
     <string name="search">search</string>
     <string name="delete">Delete</string>
     <string name="move">Move</string>
+    <string name="enlarge_image">Enlarge</string>
 </resources>

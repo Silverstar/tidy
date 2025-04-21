@@ -27,4 +27,20 @@
         app:layout_constraintTop_toTopOf="parent"
         tools:visibility="visible" />
 
+    <ImageButton
+        android:id="@+id/enlarge_button"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_margin="8dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:clickable="true"
+        android:contentDescription="@string/enlarge_image"
+        android:focusable="true"
+        android:padding="4dp"
+        android:scaleType="fitCenter"
+        android:src="@android:drawable/ic_menu_zoom"
+        app:layout_constraintBottom_toBottomOf="@id/item_image"
+        app:layout_constraintEnd_toEndOf="@id/item_image"
+        app:tint="?android:attr/textColorPrimaryInverse" />
+
 </androidx.constraintlayout.widget.ConstraintLayout>
