@@ -76,7 +76,7 @@ class SearchFragment : Fragment() {
     private var selectedCountTextView: TextView? = null
     private var pendingMediaStoreMoveItems: List<Pair<Uri, Long>>? = null // Pair(SourceUri, InternalId)
     private var pendingMoveDestinationUri: Uri? = null
-    private var listCount = 0;
+    private var listCount = 0
     private lateinit var folderPickerLauncher: ActivityResultLauncher<Uri?> // Added RequiresApi below
     private lateinit var storagePermissionLauncher: ActivityResultLauncher<Array<String>> // Added RequiresApi below
     private lateinit var manageStorageLauncher: ActivityResultLauncher<Intent> // Added RequiresApi below
@@ -232,7 +232,7 @@ class SearchFragment : Fragment() {
         }
 
         if(!selectionTracker.hasSelection()) {
-            listCount = mSearchViewModel.searchResults?.size!!;
+            listCount = mSearchViewModel.searchResults?.size!!
             selectedCountTextView?.visibility = View.VISIBLE
             selectedCountTextView?.text = "$listCount Images"
         }
@@ -405,7 +405,7 @@ class SearchFragment : Fragment() {
             }
         }
 
-        deleteButton?.setOnClickListener {
+        deleteButton.setOnClickListener {
             val selectedIds = selectionTracker.selection.toList()
             if (selectedIds.isEmpty()) {
                 Toast.makeText(context, "No images selected", Toast.LENGTH_SHORT).show()
@@ -1158,11 +1158,11 @@ class SearchFragment : Fragment() {
 
         val selectedCount = selectionTracker.selection.size()
         val hasSelection = selectedCount > 0
-        val lsCount = listCount;
+        val lsCount = listCount
         Log.d("SelectionUI", "Updating UI. Count: $selectedCount, HasSelection: $hasSelection")
 
         moveButton?.visibility = if (hasSelection) View.VISIBLE else View.GONE
-        deleteButton?.visibility = if (hasSelection) View.VISIBLE else View.GONE
+        deleteButton.visibility = if (hasSelection) View.VISIBLE else View.GONE
         //selectedCountTextView?.visibility = if (hasSelection) View.VISIBLE else View.GONE
         if (hasSelection) {
             selectedCountTextView?.text = "$selectedCount/$lsCount items selected"

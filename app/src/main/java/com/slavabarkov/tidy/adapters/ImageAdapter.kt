@@ -20,13 +20,10 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.Toast
 import androidx.core.net.toUri
-import androidx.fragment.app.FragmentTransaction
 import androidx.navigation.findNavController
 import androidx.recyclerview.selection.SelectionTracker
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
-import com.slavabarkov.tidy.fragments.ImageFragment
-import com.slavabarkov.tidy.MainActivity
 import com.slavabarkov.tidy.R
 import com.slavabarkov.tidy.data.ImageEmbedding
 
