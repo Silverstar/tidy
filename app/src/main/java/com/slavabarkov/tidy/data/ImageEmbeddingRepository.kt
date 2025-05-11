@@ -9,11 +9,11 @@ class ImageEmbeddingRepository(private val imageEmbeddingDao: ImageEmbeddingDao)
         imageEmbeddingDao.addImageEmbedding(imageEmbedding)
     }
 
-    suspend fun getRecord(id: Long): ImageEmbedding {
-        return imageEmbeddingDao.getRecord(id)
-    }
+//    suspend fun getRecord(id: Long): ImageEmbedding? {
+//        return imageEmbeddingDao.getRecord(id)
+//    }
 
     suspend fun deleteMultipleRecords(ids: List<Long>) {
-        imageEmbeddingDao.deleteMultipleRecords(ids)
+        imageEmbeddingDao.deleteMultipleRecordsByInternalId(ids)
     }
 }

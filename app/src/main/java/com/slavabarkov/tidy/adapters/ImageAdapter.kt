@@ -5,6 +5,7 @@
 package com.slavabarkov.tidy.adapters
 
 import android.annotation.SuppressLint
+import android.content.ContentUris
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
@@ -18,33 +19,37 @@ import android.widget.CheckBox
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.Toast
+import androidx.core.net.toUri
 import androidx.fragment.app.FragmentTransaction
+import androidx.navigation.findNavController
 import androidx.recyclerview.selection.SelectionTracker
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
 import com.slavabarkov.tidy.fragments.ImageFragment
 import com.slavabarkov.tidy.MainActivity
 import com.slavabarkov.tidy.R
+import com.slavabarkov.tidy.data.ImageEmbedding
 
 
-class ImageAdapter(private val context: Context, initialDataset: List<Long>) :
+// Changed constructor to accept List<ImageEmbedding>
+class ImageAdapter(private val context: Context, initialDataset: List<ImageEmbedding>) :
     RecyclerView.Adapter<ImageAdapter.ImageViewHolder>() {
-    private var dataset: List<Long> = initialDataset // Mutable dataset
-    private val uri: Uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+    private var dataset: List<ImageEmbedding> = initialDataset
+
     lateinit var selectionTracker: SelectionTracker<Long>
 
     init {
         setHasStableIds(true) // Enable stable IDs
     }
 
-    fun updateData(newDataset: List<Long>) {
+    fun updateData(newDataset:  List<ImageEmbedding>) {
         dataset = newDataset
         Log.d("ImageAdapter", "updateData called. New size: ${newDataset.size}. Selection NOT cleared here.") // Add log
        //selectionTracker.clearSelection() // Reset selection state
         notifyDataSetChanged()
     }
 
-    fun getDataset(): List<Long> = dataset // Add this to access dataset
+    fun getDataset(): List<ImageEmbedding> = dataset // Add this to access dataset
 
     class ImageViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val imageView: ImageView = view.findViewById(R.id.item_image)
@@ -62,58 +67,171 @@ override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ImageViewHold
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onBindViewHolder(holder: ImageViewHolder, position: Int) {
+        // Use getOrNull for safety in case dataset changes during binding
+        val itemEmbedding = dataset.getOrNull(position)
         val item = dataset[position]
-        val imageUri = Uri.withAppendedPath(uri, item.toString())
+        // val imageUri = Uri.withAppendedPath(uri, item.toString())
         val checkBox = holder.checkBox
 
-        Glide.with(context).load(imageUri).thumbnail().into(holder.imageView)
+        if (itemEmbedding == null) {
+            Log.e("ImageAdapter", "Binding failed: itemEmbedding is null for position $position")
+            // Clear view or show placeholder
+            holder.imageView.setImageResource(R.drawable.ic_baseline_broken_image_24)
+            holder.checkBox.visibility = View.GONE
+            holder.itemView.setOnClickListener(null) // Remove listeners if item is invalid
+            holder.imageView.setOnLongClickListener(null)
+            holder.enlargeButton.setOnClickListener(null)
+            holder.enlargeButton.setOnTouchListener(null)
+            return
+        }
+
+        // Use the stable internalId for selection tracking
+        val itemInternalId = itemEmbedding.internalId
+        // --- Determine the correct URI to load ---
+        val imageUriToLoad: Uri? = when {
+            !itemEmbedding.documentUri.isNullOrBlank() -> {
+                try {
+                    itemEmbedding.documentUri.toUri() // Parse the stored String URI
+                } catch (e: Exception) {
+                    Log.e(
+                        "ImageAdapter",
+                        "Error parsing document URI: ${itemEmbedding.documentUri} for internalId $itemInternalId",
+                        e
+                    )
+                    null
+                }
+            }
+
+            itemEmbedding.mediaStoreId != null -> {
+                try {
+                    ContentUris.withAppendedId(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        itemEmbedding.mediaStoreId
+                    )
+                } catch (e: Exception) {
+                    Log.e(
+                        "ImageAdapter",
+                        "Error building MediaStore URI for mediaStoreId: ${itemEmbedding.mediaStoreId} for internalId $itemInternalId",
+                        e
+                    )
+                    null
+                }
+            }
+
+            else -> {
+                Log.e(
+                    "ImageAdapter",
+                    "ImageEmbedding has neither documentUri nor mediaStoreId for internalId: $itemInternalId"
+                )
+                null
+            }
+        }
+        // --- End URI determination ---
+
+
+        // Load image using the determined URI with Glide
+        if (imageUriToLoad != null) {
+            Log.d("AdapterDebug", "Loading URI for ID $itemInternalId: $imageUriToLoad")
+            Glide.with(context)
+                .load(imageUriToLoad)
+                .placeholder(R.drawable.ic_baseline_image_24)
+                .error(R.drawable.ic_baseline_broken_image_24)
+                .thumbnail()
+                .into(holder.imageView)
+        } else {
+            Log.e("AdapterDebug", "URI is NULL for InternalID: $itemInternalId")
+            holder.imageView.setImageResource(R.drawable.ic_baseline_broken_image_24)
+        }
 
         // Selection State Handling
-        holder.itemView.isActivated = selectionTracker.isSelected(item) // Use the item ID directly
+        // --- Selection State Handling (uses internalId now) ---
+        val isSelected = selectionTracker.isSelected(itemInternalId)
+        holder.itemView.isActivated = isSelected
+        holder.checkBox.isChecked = isSelected
+        // Define the navigation logic (can use explicit label for early return)
+        // Define the navigation logic with detailed logs
+        // Define the navigation logic lambda (adapted from your original)
+        // Moved outside the listener setup for clarity, but still defined within onBindViewHolder scope
+        val performNavigation: (Uri?, Long) -> Unit = navLambda@{ uriForNav, internalIdForNav ->
+            Log.d("ClickListenerDebug", "==> performNavigation called for internalId: $internalIdForNav")
 
-        checkBox.setOnClickListener {
-            if (checkBox.isChecked) {
-                selectionTracker.select(item)
+            val uriString = uriForNav?.toString()
+            if (uriString == null) {
+                Log.e("ClickListenerDebug", "performNavigation: Image URI is null. Exiting.")
+                Toast.makeText(context, "Error: Image data missing.", Toast.LENGTH_SHORT).show()
+                return@navLambda // Exit lambda
+            }
+            Log.d("ClickListenerDebug", "performNavigation: URI is valid: $uriString")
+
+            try {
+                Log.d("ClickListenerDebug", "performNavigation: Inside try block.")
+
+                // Create the Bundle with arguments (names must match those in navigation.xml)
+                val arguments = Bundle().apply {
+                    putLong("internalId", internalIdForNav)
+                    putString("imageUriString", uriString)
+                }
+                Log.d("ClickListenerDebug", "performNavigation: Arguments created: $arguments")
+
+                // Find the NavController associated with the Fragment hosting this RecyclerView
+                // We use holder.itemViewContainer which is the root view of the list item layout
+                val navController =  holder.itemView.findNavController()
+
+                // Navigate using the action ID defined in navigation.xml
+                // Pass the arguments Bundle
+                navController.navigate(R.id.action_searchFragment_to_imageFragment, arguments)
+
+                Log.d("ClickListenerDebug", "performNavigation: navController.navigate() called.")
+
+            } catch (e: IllegalStateException) {
+                // Catch specific exception if NavController is not found (e.g., view not attached)
+                Log.e("ClickListenerDebug", "performNavigation: Could not find NavController. Is the view attached?", e)
+                Toast.makeText(context, "Navigation Error (Controller)", Toast.LENGTH_SHORT).show()
+            } catch (e: IllegalArgumentException) {
+                // Catch specific exception if action ID is invalid
+                Log.e("ClickListenerDebug", "performNavigation: Invalid action ID or arguments.", e)
+                Toast.makeText(context, "Navigation Error (Action)", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                // Catch general exceptions
+                Log.e("ClickListenerDebug", "performNavigation: Exception during navigation.", e)
+                Toast.makeText(context, "Error opening image.", Toast.LENGTH_SHORT).show()
+            }
+            Log.d("ClickListenerDebug", "<== performNavigation finished.")
+        }
+
+        holder.checkBox.setOnClickListener {
+            // Toggle selection using internalId
+            if (selectionTracker.isSelected(itemInternalId)) {
+                selectionTracker.deselect(itemInternalId)
             } else {
-                selectionTracker.deselect(item)
+                selectionTracker.select(itemInternalId)
             }
         }
 
+        // --- Image Click Handling ---
         holder.imageView.setOnClickListener {
             if (selectionTracker.hasSelection()) {
                 // If selection is active, toggle selection
-                if (selectionTracker.isSelected(item)) {
-                    selectionTracker.deselect(item)
+                if (selectionTracker.isSelected(itemInternalId)) {
+                    selectionTracker.deselect(itemInternalId)
                 } else {
-                    selectionTracker.select(item)
+                    selectionTracker.select(itemInternalId)
                 }
-
             } else {
-                val arguments = Bundle()
-                arguments.putLong("image_id", item)
-                arguments.putString("image_uri", imageUri.toString())
-
-
-                val transaction: FragmentTransaction =
-                    (context as MainActivity).supportFragmentManager.beginTransaction()
-
-                val fragment = ImageFragment()
-                fragment.arguments = arguments
-                transaction.addToBackStack("search_fragment")
-                transaction.replace(R.id.fragmentContainerView, fragment)
-                transaction.addToBackStack("image_fragment")
-                transaction.commit()
+                // Navigate using the determined URI and internalId
+                performNavigation(imageUriToLoad, itemInternalId) // Call adapted performNavigation
             }
-
         }
 
+        // --- Image Long Click Handling ---
         holder.imageView.setOnLongClickListener {
             if (!selectionTracker.hasSelection()) {
-                selectionTracker.select(item)
+                selectionTracker.select(itemInternalId)
                 return@setOnLongClickListener true // Consume the long click
             }
-            false
+            false // Don't consume if selection already active
         }
+
         // Add SuppressLint for the warning we are structurally addressing
 
         holder.enlargeButton.setOnTouchListener { view, motionEvent ->
@@ -124,6 +242,7 @@ override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ImageViewHold
                     // Return false: We handled the flag, but let event continue
                     false
                 }
+
                 MotionEvent.ACTION_UP -> {
                     // Call performClick when touch gesture completes UP
                     // This triggers the OnClickListener and accessibility events
@@ -134,96 +253,49 @@ override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ImageViewHold
                     // (Though performClick runs the OnClickListener logic)
                     true
                 }
+
                 MotionEvent.ACTION_CANCEL -> {
                     // Reset the disallow flag
                     view.parent.requestDisallowInterceptTouchEvent(false)
                     false
                 }
+
                 else -> {
                     // Don't consume other events like MOVE
                     false
                 }
             }
         }
-        // Define the navigation logic (can use explicit label for early return)
-        // Define the navigation logic with detailed logs
-        val performNavigation: (View) -> Unit = navLambda@{ view ->
-            Log.d("ClickListenerDebug", "==> performNavigation called. HasSelection: ${selectionTracker.hasSelection()}")
-
-            val uriString = imageUri?.toString()
-            if (uriString == null) {
-                Log.e("ClickListenerDebug", "performNavigation: Image URI is null. Exiting.")
-                Toast.makeText(context, "Error: Image data missing.", Toast.LENGTH_SHORT).show()
-                return@navLambda // Exit lambda
-            }
-            Log.d("ClickListenerDebug", "performNavigation: URI is valid: $uriString")
-
-            try {
-                Log.d("ClickListenerDebug", "performNavigation: Inside try block.")
-                // Ensure context is MainActivity (or use NavController if you switch)
-                if (context is MainActivity) {
-                    Log.d("ClickListenerDebug", "performNavigation: Context is MainActivity.")
-                    val arguments = Bundle()
-                    arguments.putLong("image_id", item)
-                    arguments.putString("image_uri", uriString)
-                    Log.d("ClickListenerDebug", "performNavigation: Arguments created: $arguments")
-
-                    val transaction: FragmentTransaction =
-                        context.supportFragmentManager.beginTransaction()
-                    Log.d("ClickListenerDebug", "performNavigation: FragmentTransaction begun.")
-
-                    val fragment = ImageFragment()
-                    fragment.arguments = arguments
-                    Log.d("ClickListenerDebug", "performNavigation: ImageFragment created with args.")
-
-                    transaction.replace(R.id.fragmentContainerView, fragment)
-                    Log.d("ClickListenerDebug", "performNavigation: replace called.")
-
-                    transaction.addToBackStack("image_fragment")
-                    Log.d("ClickListenerDebug", "performNavigation: addToBackStack called.")
-
-                    // Use commit() first, only use commitAllowingStateLoss if absolutely necessary and understand the implications
-                    transaction.commit()
-                    // transaction.commitAllowingStateLoss()
-                    Log.d("ClickListenerDebug", "performNavigation: commit() called.")
-
-                } else {
-                    Log.e("ClickListenerDebug", "performNavigation: Context is NOT MainActivity.")
-                    Toast.makeText(context, "Navigation Error (Context)", Toast.LENGTH_SHORT).show()
-                }
-            } catch (e: Exception) {
-                Log.e("ClickListenerDebug", "performNavigation: Exception during fragment transaction.", e)
-                Toast.makeText(context, "Error opening image.", Toast.LENGTH_SHORT).show()
-            }
-            Log.d("ClickListenerDebug", "<== performNavigation finished.")
-        }
 
 
         // Set the OnClickListener for the enlarge button
         holder.enlargeButton.setOnClickListener { clickedView ->
-            Log.d("ClickListenerDebug", "EnlargeButton OnClickListener triggered for item $item")
-            Log.d("ClickListenerDebug", "*******************************************")
-            Log.d("ClickListenerDebug", "EnlargeButton OnClickListener triggered!")
-            Log.d("ClickListenerDebug", "Calling performNavigation...")
-            Log.d("ClickListenerDebug", "*******************************************")
-            // *** Use view.post to delay the navigation ***
-                performNavigation(clickedView) // Call the navigation logic
+            Log.d(
+                "ClickListenerDebug",
+                "EnlargeButton OnClickListener triggered for item internalId $itemInternalId"
+            )
+            // Call the adapted navigation logic
+            performNavigation(imageUriToLoad, itemInternalId)
         }
         // *** END Listener Setup ***
 
 
+        // Checkbox visibility based on selection mode
         if (selectionTracker.hasSelection()) {
-            checkBox.visibility = View.VISIBLE
-            checkBox.isChecked = selectionTracker.isSelected(item)
+            holder.checkBox.visibility = View.VISIBLE
         } else {
-            checkBox.visibility = View.GONE
-            checkBox.isChecked = false
+            holder.checkBox.visibility = View.GONE
         }
     }
-
-    override fun getItemId(position: Int): Long {
-        return dataset[position] // Directly use the item ID from your dataset
-    }
+        // getItemId MUST return the stable ID used by SelectionTracker - the internalId
+        override fun getItemId(position: Int): Long {
+            // Check bounds to prevent crash if dataset is modified unexpectedly
+            return if (position >= 0 && position < dataset.size) {
+                dataset[position].internalId
+            } else {
+                RecyclerView.NO_ID // Return invalid ID if position is out of bounds
+            }
+        }
 
 
 }

@@ -1,63 +1,38 @@
 package com.slavabarkov.tidy.adapters
 
-import android.graphics.Rect // *** Import Rect ***
 import android.view.MotionEvent
 import androidx.recyclerview.selection.ItemDetailsLookup
 import androidx.recyclerview.widget.RecyclerView
 
+/**
+ * Looks up item details (specifically the key/internalId) for a given MotionEvent
+ * occurring on the RecyclerView.
+ */
 class ImageItemDetailsLookup(private val recyclerView: RecyclerView) : ItemDetailsLookup<Long>() {
-    override fun getItemDetails(event: MotionEvent): ItemDetails<Long>? {
-        val view = recyclerView.findChildViewUnder(event.x, event.y)
+
+    override fun getItemDetails(e: MotionEvent): ItemDetails<Long>? {
+        val view = recyclerView.findChildViewUnder(e.x, e.y)
         if (view != null) {
             val viewHolder = recyclerView.getChildViewHolder(view)
-            // Check if the ViewHolder is the correct type
+            // Check if the ViewHolder is the correct type for our adapter
             if (viewHolder is ImageAdapter.ImageViewHolder) {
-
-                // *** START FIX: Check if the click is on the enlarge button ***
-                val enlargeButton = viewHolder.enlargeButton // Get button from ViewHolder
-                val buttonRect = Rect()
-                // Get the hit rectangle of the button in the coordinate system of the RecyclerView item view
-                enlargeButton.getHitRect(buttonRect)
-
-                // Check if the MotionEvent coordinates (relative to the item view) are inside the button's hit rectangle
-                if (buttonRect.contains(event.x.toInt() - view.left, event.y.toInt() - view.top)) {
-                    // If the click is inside the button, return null to prevent selection
-                    return null
-                }
-                // *** END FIX ***
-
-
-                // If the click was NOT on the button, proceed with getting item details
                 val position = viewHolder.adapterPosition
+                // Check if the position is valid
                 if (position != RecyclerView.NO_POSITION) {
-                    // Ensure the adapter is the correct type before accessing getItemId
-                    val adapter = recyclerView.adapter
-                    if (adapter is ImageAdapter) {
-                        val itemId = adapter.getItemId(position)
+                    // Get the stable ID (internalId) using the adapter method
+                    val itemId = recyclerView.adapter?.getItemId(position)
+                    // Check if the ID is valid
+                    if (itemId != null && itemId != RecyclerView.NO_ID) {
+                        // Return an ItemDetails object containing the position and the ID
                         return object : ItemDetails<Long>() {
-                            override fun getPosition(): Int {
-                                return position
-                            }
-
-                            override fun getSelectionKey(): Long {
-                                return itemId // Return the item ID as the key
-                            }
-
-                            // Optional: If you need finer control based on touch area later
-                            // override fun inSelectionHotspot(e: MotionEvent): Boolean {
-                            //     return true // Or specific logic if needed
-                            // }
-
-                            // Optional: If you need drag handles later
-                            // override fun inDragRegion(e: MotionEvent): Boolean {
-                            //     return false // Or specific logic if needed
-                            // }
+                            override fun getPosition(): Int = position
+                            override fun getSelectionKey(): Long = itemId
                         }
                     }
                 }
             }
         }
-        // If no valid item view or details found (or click was on button), return null
+        // Return null if no item details could be found for the event
         return null
     }
 }

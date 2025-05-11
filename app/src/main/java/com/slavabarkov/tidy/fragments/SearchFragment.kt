@@ -6,6 +6,7 @@ package com.slavabarkov.tidy.fragments
 
 import android.Manifest
 import android.app.Activity
+import android.app.PendingIntent
 import android.app.RecoverableSecurityException
 import android.content.ContentResolver
 import android.content.ContentUris
@@ -49,10 +50,12 @@ import androidx.activity.result.IntentSenderRequest
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import java.util.Collections
-import java.util.concurrent.atomic.AtomicInteger
 import androidx.activity.result.ActivityResultLauncher
 import androidx.appcompat.app.AlertDialog
+import androidx.core.net.toUri
+import androidx.documentfile.provider.DocumentFile
+import com.slavabarkov.tidy.data.ImageEmbedding
+import kotlinx.coroutines.withContext
 
 class SearchFragment : Fragment() {
     private var searchText: TextView? = null
@@ -67,119 +70,221 @@ class SearchFragment : Fragment() {
     private lateinit var imageAdapter: ImageAdapter // Single instance
     private lateinit var recyclerView: RecyclerView
     private lateinit var deleteResultLauncher: ActivityResultLauncher<IntentSenderRequest>
+    private lateinit var modifyPermissionLauncher: ActivityResultLauncher<IntentSenderRequest>
     private lateinit var deleteButton: Button
     private var pendingDeleteIds: List<Long>? = null
     private var selectedCountTextView: TextView? = null
-    // Permission launcher for MANAGE_EXTERNAL_STORAGE
-    @RequiresApi(Build.VERSION_CODES.R)
-    // Permission launchers
-    private val storagePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
-        Log.d("SearchFragment", "Storage permissions result: $permissions")
-        val readGranted = permissions[Manifest.permission.READ_EXTERNAL_STORAGE] == true
-        val writeGranted = permissions[Manifest.permission.WRITE_EXTERNAL_STORAGE] == true
-        Log.d("SearchFragment", "READ_EXTERNAL_STORAGE: $readGranted, WRITE_EXTERNAL_STORAGE: $writeGranted")
-        if (readGranted && writeGranted) {
-            Toast.makeText(context, "Storage permissions granted", Toast.LENGTH_SHORT).show()
-            moveButton?.isEnabled = true
-        } else {
-            Toast.makeText(context, "Storage permissions denied", Toast.LENGTH_LONG).show()
-            moveButton?.isEnabled = false
-        }
-    }
+    private var pendingMediaStoreMoveItems: List<Pair<Uri, Long>>? = null // Pair(SourceUri, InternalId)
+    private var pendingMoveDestinationUri: Uri? = null
+    private var listCount = 0;
+    private lateinit var folderPickerLauncher: ActivityResultLauncher<Uri?> // Added RequiresApi below
+    private lateinit var storagePermissionLauncher: ActivityResultLauncher<Array<String>> // Added RequiresApi below
+    private lateinit var manageStorageLauncher: ActivityResultLauncher<Intent> // Added RequiresApi below
 
-    private val manageStorageLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        Log.d("SearchFragment", "Manage storage result: ${result.resultCode}")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
-            Toast.makeText(context, "Full storage access granted", Toast.LENGTH_SHORT).show()
-            moveButton?.isEnabled = true
-        } else {
-            Toast.makeText(context, "Full storage access denied", Toast.LENGTH_LONG).show()
-            moveButton?.isEnabled = false
-        }
-    }
 
-    @RequiresApi(Build.VERSION_CODES.R)
+    @RequiresApi(Build.VERSION_CODES.R) // Added RequiresApi here due to launchers
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestFullStoragePermission()
+        // Initialize launchers here
+        initializeLaunchers() // Moved launcher initialization to a separate function
+    }
+
+    // Moved launcher initialization here for clarity
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun initializeLaunchers() {
+        storagePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+            Log.d("SearchFragment", "Storage permissions result: $permissions")
+            val readGranted = permissions[Manifest.permission.READ_EXTERNAL_STORAGE] == true
+            if (readGranted) {
+                moveButton?.isEnabled = true
+            } else {
+                Toast.makeText(context, "Storage permissions denied", Toast.LENGTH_LONG).show()
+                moveButton?.isEnabled = false
+            }
+        }
+
+        manageStorageLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            Log.d("SearchFragment", "Manage storage result: ${result.resultCode}")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
+                Toast.makeText(context, "Full storage access granted", Toast.LENGTH_SHORT).show()
+                moveButton?.isEnabled = true
+            } else {
+                Toast.makeText(context, "Full storage access denied", Toast.LENGTH_LONG).show()
+                moveButton?.isEnabled = false
+            }
+        }
+
         deleteResultLauncher = registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
             val idsSuccessfullyProcessed = pendingDeleteIds // Get the IDs we were working on
             pendingDeleteIds = null // Clear the temporary list immediately
             if (result.resultCode == Activity.RESULT_OK) {
-                Log.d("SearchFragment", "Delete permission granted via IntentSender.")
-                // Check if we have IDs stored (meaning this likely came from API 30+ createTrashRequest or API 29 Recoverable)
-                if (!idsSuccessfullyProcessed.isNullOrEmpty()) {
-                    // Assume the operation succeeded for the requested IDs (either trashed on 30+ or permission granted on 29)
-                    // Call handleSuccessfulDeletion to update DB, ViewModel state, and UI
-                    Log.d("SearchFragment", "Processing successful deletion/trashing for IDs: $idsSuccessfullyProcessed")
-                    handleSuccessfulDeletion(idsSuccessfullyProcessed, emptyList()) // Pass empty list for failures here
-                } else {
-                    // This case might happen if pendingDeleteIds was null (unexpected) or empty
-                    // Or potentially after an API 29 RecoverableSecurityException where we only prompted for one item.
-                    // You might just show a generic success/refresh message or specific logic for API 29 retry.
-                    Log.w(
-                        "SearchFragment",
-                        "RESULT_OK received, but no pending IDs found or specific retry logic needed."
-                    )
-                }
-                Toast.makeText(context, "Permission granted. Please try deleting again.", Toast.LENGTH_SHORT).show()
+                Log.d("SearchFragment", "Delete/Trash permission granted via IntentSender.")
+                // On API 30+, this means the trash request was confirmed.
+                // On API 29, this means permission for a specific item was granted.
+                // We need to re-initiate the deletion for the granted item(s) or inform the user.
+                // A simple approach is to inform the user and let them press delete again.
+                Toast.makeText(context, "Permission granted. Please try the delete operation again.", Toast.LENGTH_LONG).show()
+                // More complex: Re-trigger initiateMediaStoreDeletion(idsSuccessfullyProcessed) if needed.
             } else {
-                Log.w("SearchFragment", "Delete permission denied.")
-                Toast.makeText(context, "Deletion cancelled.", Toast.LENGTH_SHORT).show()
+                Log.w("SearchFragment", "Delete/Trash permission denied via IntentSender.")
+                Toast.makeText(context, "Operation cancelled or permission denied.", Toast.LENGTH_SHORT).show()
+                // Ensure UI reflects that deletion didn't happen (e.g., selection remains)
+                // updateAdapterAfterModification(emptyList(), idsSuccessfullyProcessed ?: emptyList()) // Mark original items as failed?
             }
         }
-    }
 
-    // Folder picker launcher
-    @RequiresApi(Build.VERSION_CODES.R)
-    private val folderPickerLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        uri?.let { moveImagesToFolder(it) }
-    }
+        modifyPermissionLauncher = registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+            val itemsToProcess = pendingMediaStoreMoveItems
+            val destinationUri = pendingMoveDestinationUri
+            pendingMediaStoreMoveItems = null
+            pendingMoveDestinationUri = null
 
+            if (result.resultCode == Activity.RESULT_OK && itemsToProcess != null && destinationUri != null) {
+                Log.d("SearchFragment", "MediaStore write/move permission granted via IntentSender for ${itemsToProcess.size} items.")
+                performMediaStoreMove(itemsToProcess, destinationUri)
+            } else {
+                Log.w("SearchFragment", "MediaStore write/move permission denied or state error.")
+                Toast.makeText(context, "Permission denied, cannot move MediaStore files.", Toast.LENGTH_SHORT).show()
+                // Mark these items as failed
+                if (itemsToProcess != null) {
+                    handleMoveCompletion(emptyList(), itemsToProcess.map { it.second })
+                }
+            }
+        }
 
-    override fun onResume() {
-        super.onResume()
-        searchText = view?.findViewById(R.id.searchText)
-        val recyclerView = view?.findViewById<RecyclerView>(R.id.recycler_view)
-
-        if (mSearchViewModel.fromImg2ImgFlag) {
-            searchText?.text = null
-            recyclerView?.scrollToPosition(0)
-            mSearchViewModel.fromImg2ImgFlag = false
+        folderPickerLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            uri?.let { moveImagesToFolder(it) }
         }
     }
+
+    // --- START: onResume with Consistency Check ---
+    override fun onResume() {
+        super.onResume()
+        Log.d("SearchFragment", "onResume called.")
+
+        // Get the current master list of IDs and the map from ORTViewModel
+        val masterIdList = mORTImageViewModel.idxList
+        val masterEmbeddingMap = mORTImageViewModel.getAllLoadedEmbeddingsMap()
+        Log.d("SearchFragment", "onResume: ORT ViewModel State - idxList size: ${masterIdList.size}, embeddingMap size: ${masterEmbeddingMap.size}")
+
+        // Get the list currently held by SearchViewModel
+        var currentSearchIds = mSearchViewModel.searchResults
+
+        // Check for consistency
+        var needsReset = false
+        if (currentSearchIds == null) {
+            // If SearchViewModel is null, initialize it (first launch scenario)
+            Log.d("SearchFragment", "onResume: SearchViewModel results are null, initializing.")
+            needsReset = true
+        } else {
+            // If SearchViewModel has IDs, check if the *first* ID it holds
+            // actually exists in the *current* master map from ORTViewModel.
+            // This is a heuristic: if the first item is gone, the list is likely stale
+            // due to re-indexing. Checking just the first is efficient.
+            val firstId = currentSearchIds.firstOrNull()
+            if (firstId != null && !masterEmbeddingMap.containsKey(firstId)) {
+                Log.w("SearchFragment", "onResume: First ID ($firstId) from SearchViewModel not found in ORTViewModel map. Assuming stale data due to re-indexing.")
+                needsReset = true
+            } else if (firstId == null && masterIdList.isNotEmpty()) {
+                // If SearchViewModel has an empty list, but ORTViewModel now has data
+                Log.d("SearchFragment", "onResume: SearchViewModel has empty list but ORTViewModel has data. Resetting.")
+                needsReset = true
+            }
+        }
+
+        // Reset SearchViewModel if needed
+        if (needsReset) {
+            Log.d("SearchFragment", "onResume: Resetting SearchViewModel results to match ORTViewModel.")
+            currentSearchIds = masterIdList.reversed() // Use the current default list
+            mSearchViewModel.searchResults = currentSearchIds // Update the ViewModel
+
+            // Clear search text and selection when resetting to default
+            searchText?.text = null
+            if(::selectionTracker.isInitialized) {
+                selectionTracker.clearSelection()
+                mSearchViewModel.clearSavedSelection()
+            }
+        } else {
+            Log.d("SearchFragment", "onResume: Keeping existing results in SearchViewModel. Count: ${currentSearchIds?.size ?: "null"}")
+        }
+
+        // Fetch embeddings based on the (potentially updated) currentSearchIds
+        val currentEmbeddings = getEmbeddingsForIds(currentSearchIds ?: emptyList())
+        Log.d("SearchFragment", "onResume: Fetched embeddings for adapter. Count: ${currentEmbeddings.size}")
+
+        // Update the adapter
+        if (::imageAdapter.isInitialized) {
+            imageAdapter.updateData(currentEmbeddings)
+            Log.d("SearchFragment", "onResume: Adapter data updated.")
+            // Optionally scroll to top if we reset the list
+            if (needsReset) {
+                recyclerView.scrollToPosition(0)
+            }
+        } else {
+            Log.w("SearchFragment", "onResume: imageAdapter not initialized yet.")
+        }
+
+        // Reset the I2I flag if it was set (independent of the list reset)
+        if (mSearchViewModel.fromImg2ImgFlag) {
+            recyclerView.scrollToPosition(0)
+            mSearchViewModel.fromImg2ImgFlag = false
+            Log.d("SearchFragment", "onResume: Reset fromImg2ImgFlag to false.")
+        }
+
+        if(!selectionTracker.hasSelection()) {
+            listCount = mSearchViewModel.searchResults?.size!!;
+            selectedCountTextView?.visibility = View.VISIBLE
+            selectedCountTextView?.text = "$listCount Images"
+        }
+    }
+    // --- END: onResume with Consistency Check ---
 
     @RequiresApi(Build.VERSION_CODES.R)
     override fun onCreateView(
         inflater: LayoutInflater, container: ViewGroup?,
         savedInstanceState: Bundle?,
     ): View? {
+        Log.d("SearchFragment", "onCreateView called.")
         // INITIALIZE VIEWS
         val view = inflater.inflate(R.layout.fragment_search, container, false)
+        // Find views here (safer than relying on onResume finding them first)
         recyclerView = view.findViewById<RecyclerView>(R.id.recycler_view)
-        searchText = view?.findViewById(R.id.searchText)
-        searchButton = view?.findViewById(R.id.searchButton)
+        searchText = view.findViewById(R.id.searchText) // Use view.findViewById
+        searchButton = view.findViewById(R.id.searchButton)
         moveButton = view.findViewById(R.id.moveButton)
-        deleteButton = view.findViewById(R.id.deleteButton)  // Get the delete button
-        clearButton = view?.findViewById(R.id.clearButton)
+        deleteButton = view.findViewById(R.id.deleteButton)
+        clearButton = view.findViewById(R.id.clearButton)
         selectedCountTextView = view.findViewById<TextView>(R.id.selectedCountTextView)
 
+
+        // --- START: Reverted Data Initialization ---
+        // Initialize searchResults ONLY if it's null in the ViewModel.
+        // This preserves the existing list (e.g., search results) when the view is recreated.
         if (mSearchViewModel.searchResults == null) {
+            Log.d("SearchFragment", "onCreateView: searchResults is null, initializing from ORTImageViewModel.")
             mSearchViewModel.searchResults = mORTImageViewModel.idxList.reversed()
+        } else {
+            // If not null, it means we are returning to the fragment or the view
+            // is being recreated, and we should use the existing list.
+            Log.d("SearchFragment", "onCreateView: searchResults already exists in ViewModel. Using existing list. Count: ${mSearchViewModel.searchResults?.size ?: "null"}")
         }
+        // --- END: Reverted Data Initialization ---
+
+        Log.d("SearchFragment", "onCreateView: Synced searchResults in SearchViewModel with ORTViewModel. New Count: ${mSearchViewModel.searchResults?.size}")
+
+        // Log the state *after* syncing
+        Log.d("SearchFragment", "onCreateView: ORT idxList size: ${mORTImageViewModel.idxList.size}")
+        Log.d("SearchFragment", "onCreateView: ORT embeddingMap size: ${mORTImageViewModel.getAllLoadedEmbeddingsMap().size}")
+
+        // Get initial embeddings based on the freshly synced list
+        val initialEmbeddingList = getEmbeddingsForIds(mSearchViewModel.searchResults ?: emptyList()) // Logging inside this function
+        Log.d("SearchFragment", "onCreateView: Fetched initial embeddings. Count: ${initialEmbeddingList.size}")
+        // --- End Data Initialization ---
+
+
         //STEP 1 ADAPTER CREATION
-        imageAdapter =  ImageAdapter(requireContext(), emptyList())
+        imageAdapter =  ImageAdapter(requireContext(), initialEmbeddingList) // Pass initial data
         recyclerView.adapter = imageAdapter
-        recyclerView.scrollToPosition(0)
-
-        //STEP:2 Prepare & Set Adapter Data
-        // Set initial data
-        if (mSearchViewModel.searchResults == null) {
-            Log.d("SelectionState", "onCreateView START. searchResults is null? ${mSearchViewModel.searchResults == null}. idxList size: ${mORTImageViewModel.idxList.size}")
-            mSearchViewModel.searchResults = mORTImageViewModel.idxList.reversed()
-            Log.d("SelectionState", "onCreateView: initialData SET. Size: ${mSearchViewModel.searchResults!!.size}")
-        }
-
 
         //STEP 3
         // Initialize Selection Tracker
@@ -197,34 +302,46 @@ class SearchFragment : Fragment() {
         imageAdapter.selectionTracker = selectionTracker
 
         //--- Setup listeners that DON'T depend on restored state ---
+        // Consider if mORTTextViewModel.init() needs to be called every time or just once
         mORTTextViewModel.init()
-        imageAdapter.updateData(mSearchViewModel.searchResults!!)
 
         searchButton?.setOnClickListener {
-            val textEmbedding: FloatArray =
-                mORTTextViewModel.getTextEmbedding(searchText?.text.toString())
+            val query = searchText?.text?.toString() ?: ""
+            if (query.isBlank()) {
+                Toast.makeText(context, "Please enter search text", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            Log.d("SearchFragment", "Performing text search for: '$query'")
+            val textEmbedding: FloatArray = mORTTextViewModel.getTextEmbedding(query)
+            // Perform search using the ViewModels
             mSearchViewModel.sortByCosineDistance(textEmbedding, mORTImageViewModel.embeddingsList, mORTImageViewModel.idxList)
+
+            // Update UI after search
             if(::selectionTracker.isInitialized) selectionTracker.clearSelection()
             mSearchViewModel.clearSavedSelection()
-            imageAdapter.updateData(mSearchViewModel.searchResults!!)
-            Log.d("SelectionInfo", selectionTracker.hasSelection().toString())
+            // Get embeddings for the NEW search results
+            val searchResultEmbeddings = getEmbeddingsForIds(mSearchViewModel.searchResults ?: emptyList())
+            imageAdapter.updateData(searchResultEmbeddings)
+            recyclerView.scrollToPosition(0)
+            Log.d("SelectionInfo", "Search button clicked. Selection cleared. Has selection now: ${selectionTracker.hasSelection()}")
         }
 
 
         clearButton?.setOnClickListener{
+            Log.d("SearchFragment", "Clear button clicked.")
             searchText?.text = null
+            // Reload default list and update adapter
             mSearchViewModel.searchResults = mORTImageViewModel.idxList.reversed()
-            imageAdapter.updateData(mSearchViewModel.searchResults!!)
-            moveButton?.visibility = View.GONE
-            deleteButton.visibility = View.GONE
+            val allEmbeddingsList = getEmbeddingsForIds(mSearchViewModel.searchResults ?: emptyList())
+            imageAdapter.updateData(allEmbeddingsList)
+
+            // Clear selection state
             if(::selectionTracker.isInitialized) selectionTracker.clearSelection()
             mSearchViewModel.clearSavedSelection()
-            imageAdapter.updateData(mSearchViewModel.searchResults ?: emptyList())
+
             recyclerView.scrollToPosition(0)
         }
-
-        // Permission checks (can often happen here or onViewCreated)
-        setupPermissionChecksAndButtons()
 
         return view
     }
@@ -234,62 +351,66 @@ class SearchFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
         Log.d("LifecycleDebug", "onViewCreated called")
 
+        // Request permissions when the view is created or becomes visible
+        setupPermissionChecksAndButtons()
+
         // --- STEP 4: Restore Tracker State ---
-        // (Do this in onViewCreated after the view hierarchy is ready)
-        val savedSelection = mSearchViewModel.selectedItemIds.value
-        if (!savedSelection.isNullOrEmpty()) {
-            Log.d("SelectionState", "Attempting to restore selection from ViewModel. Count: ${savedSelection.size}")
-            // Use try-catch as setItemsSelected can potentially fail
+        if (savedInstanceState != null) {
             try {
-                if (::selectionTracker.isInitialized) { // Ensure tracker exists
-                    selectionTracker.setItemsSelected(savedSelection, true)
-                    Log.d("SelectionState", "Restored from ViewModel. Has Selection NOW: ${selectionTracker.hasSelection()}, Count: ${selectionTracker.selection.size()}")
-                } else {
-                    Log.e("SelectionState", "Cannot restore from ViewModel, tracker not initialized.")
+                if (::selectionTracker.isInitialized) {
+                    selectionTracker.onRestoreInstanceState(savedInstanceState)
+                    Log.d("SelectionState", "Restored selection from savedInstanceState. Count: ${selectionTracker.selection.size()}")
                 }
             } catch (e: Exception) {
-                Log.e("SelectionState", "Error restoring selection from ViewModel", e)
-                if (::selectionTracker.isInitialized) selectionTracker.clearSelection() // Clear if restore fails
+                Log.e("SelectionState", "Error restoring selection from savedInstanceState", e)
+                if (::selectionTracker.isInitialized) selectionTracker.clearSelection()
             }
         } else {
-            Log.d("SelectionState", "No selection found in ViewModel to restore.")
+            val savedSelection = mSearchViewModel.selectedItemIds.value
+            if (!savedSelection.isNullOrEmpty()) {
+                Log.d("SelectionState", "Attempting to restore selection from ViewModel. Count: ${savedSelection.size}")
+                try {
+                    if (::selectionTracker.isInitialized) {
+                        selectionTracker.setItemsSelected(savedSelection, true)
+                        Log.d("SelectionState", "Restored from ViewModel. Has Selection NOW: ${selectionTracker.hasSelection()}, Count: ${selectionTracker.selection.size()}")
+                    } else {
+                        Log.e("SelectionState", "Cannot restore from ViewModel, tracker not initialized.")
+                    }
+                } catch (e: Exception) {
+                    Log.e("SelectionState", "Error restoring selection from ViewModel", e)
+                    if (::selectionTracker.isInitialized) selectionTracker.clearSelection()
+                }
+            } else {
+                Log.d("SelectionState", "No selection found in ViewModel or savedInstanceState to restore.")
+            }
         }
+
 
         // --- STEP 5: Update UI based on potentially restored state ---
         updateSelectionUi()
         Log.d("SelectionState", "Initial UI update in onViewCreated complete.")
 
         // --- STEP 6: Add Selection Observer ---
-        // (Add observer after potential state restoration)
         addSelectionObserver()
 
         // --- Setup listeners that might depend on tracker state / UI elements ---
-        // Handle Move action
         moveButton?.setOnClickListener {
             Log.d("SearchFragment", "Move button clicked")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) { // Check for Android Q or higher
-                // Check permissions (MANAGE_EXTERNAL_STORAGE for R+, standard for Q)
-                if (hasStoragePermission()) {
-                    folderPickerLauncher.launch(null) // Launch folder picker for Q+
-                } else {
-                    // Request appropriate permission (MANAGE or standard READ/WRITE)
-                    requestAppropriateStoragePermissions()
-                    Toast.makeText(context, "Storage permission required", Toast.LENGTH_SHORT).show()
-                }
+            // Check permissions first
+            if (hasStoragePermission()) {
+                folderPickerLauncher.launch(null) // Launch folder picker
             } else {
-                // Handle pre-Q devices: Show a message or implement a fallback strategy
-                Toast.makeText(context, "Move feature requires Android 10 or higher", Toast.LENGTH_LONG).show()
+                requestAppropriateStoragePermissions() // Request permission if not granted
+                Toast.makeText(context, "Storage permission required to move files.", Toast.LENGTH_SHORT).show()
             }
         }
 
-        // *** Set Delete Button Click Listener ***
-        deleteButton.setOnClickListener {
+        deleteButton?.setOnClickListener {
             val selectedIds = selectionTracker.selection.toList()
             if (selectedIds.isEmpty()) {
                 Toast.makeText(context, "No images selected", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            //show confirmation dialog
             showDeleteConfirmationDialog(selectedIds)
         }
 
@@ -297,151 +418,489 @@ class SearchFragment : Fragment() {
         Log.d("LifecycleDebug", "onViewCreated finished")
     }
 
-    private fun hasStoragePermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Environment.isExternalStorageManager()
-        } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q) {
-            // On Q, we just need standard permissions usually granted via manifest or runtime request
-            checkStoragePermissions() // Reuse your existing check for READ/WRITE
-        } else {
-            // Below Q, this strategy isn't used, but keep check for completeness
-            checkStoragePermissions()
+    // --- Add onSaveInstanceState to save tracker state ---
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        if (::selectionTracker.isInitialized) {
+            try {
+                selectionTracker.onSaveInstanceState(outState)
+                Log.d("SelectionState", "Saved selection state to Bundle. Count: ${selectionTracker.selection.size()}")
+            } catch (e: Exception) {
+                Log.e("SelectionState", "Error saving selection state", e)
+            }
         }
+    }
+    // --- End onSaveInstanceState ---
+
+    private fun hasStoragePermission(): Boolean {
+        // On R+, check for MANAGE_EXTERNAL_STORAGE
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager()
+        }
+        // On Q and below, check for standard READ_EXTERNAL_STORAGE
+        return ContextCompat.checkSelfPermission(
+            requireContext(),
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED
+        // Note: Write permission is handled differently by SAF/MediaStore on Q+
     }
 
     @RequiresApi(Build.VERSION_CODES.R)
     private fun requestFullStoragePermission() {
         Log.d("SearchFragment", "Requesting MANAGE_EXTERNAL_STORAGE")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-            val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-            manageStorageLauncher.launch(intent)
+        if (!Environment.isExternalStorageManager()) {
+            try {
+                val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                Toast.makeText(context, "Full storage access required for moving files freely.", Toast.LENGTH_LONG).show()
+                manageStorageLauncher.launch(intent)
+            } catch (e: Exception) {
+                Log.e("SearchFragment", "Error launching MANAGE_ALL_FILES_ACCESS_PERMISSION intent", e)
+                Toast.makeText(context, "Could not open storage settings.", Toast.LENGTH_SHORT).show()
+                // Optionally request standard permissions as fallback?
+                // requestStoragePermissions()
+            }
+        } else {
+            Log.d("SearchFragment", "MANAGE_EXTERNAL_STORAGE already granted.")
+            moveButton?.isEnabled = true // Ensure button is enabled if permission already granted
         }
     }
 
-    @RequiresApi(Build.VERSION_CODES.R)
+    @RequiresApi(Build.VERSION_CODES.R) // Keep RequiresApi for consistency if calling R+ specific APIs inside
     private fun requestStoragePermissions() {
-        Log.d("SearchFragment", "Requesting READ/WRITE_EXTERNAL_STORAGE")
-        val permissions = arrayOf(
-            Manifest.permission.READ_EXTERNAL_STORAGE,
-            Manifest.permission.WRITE_EXTERNAL_STORAGE
-        )
-        storagePermissionLauncher.launch(permissions)
+        Log.d("SearchFragment", "Requesting READ_EXTERNAL_STORAGE")
+        // Only need READ_EXTERNAL_STORAGE for accessing files on older APIs
+        // WRITE_EXTERNAL_STORAGE is deprecated/less relevant for Q+
+        storagePermissionLauncher.launch(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE))
     }
 
     @RequiresApi(Build.VERSION_CODES.R)
     private fun requestAppropriateStoragePermissions() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            requestFullStoragePermission()
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // On Q, request standard READ/WRITE if not granted
-            if (!checkStoragePermissions()) {
-                requestStoragePermissions()
-            }
-        } else {
-            // Below Q - potentially request READ/WRITE if a fallback is ever implemented
-            if (!checkStoragePermissions()) {
-                requestStoragePermissions()
+            requestFullStoragePermission() // Request MANAGE_EXTERNAL_STORAGE on R+
+        } else { // Covers Q and below
+            if (!checkStoragePermissions()) { // Check if READ is granted
+                requestStoragePermissions() // Request READ if not granted
             }
         }
     }
 
-    private fun checkStoragePermissions(): Boolean {
+    private fun checkStoragePermissions(): Boolean { // Renamed for clarity
         val readGranted = ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-        val writeGranted = ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-        Log.d("SearchFragment", "Checking permissions - READ: $readGranted, WRITE: $writeGranted")
-        return readGranted && writeGranted
+        Log.d("SearchFragment", "Checking READ_EXTERNAL_STORAGE: $readGranted")
+        return readGranted
     }
 
+    // Using ContentResolver.update with RELATIVE_PATH (Requires API 29+)
+    @RequiresApi(Build.VERSION_CODES.R) // Keep RequiresApi for consistency
+    private fun moveImagesToFolder(destinationFolderUri: Uri) {
+        Log.d("SearchFragment", "moveImagesToFolder started. Destination: $destinationFolderUri")
+        val selectedInternalIds = selectionTracker.selection.toList()
+        if (selectedInternalIds.isEmpty()) {
+            Toast.makeText(context, "No items selected.", Toast.LENGTH_SHORT).show()
+            return
+        }
 
-// Using ContentResolver.update with RELATIVE_PATH (Requires API 29+)
-    @RequiresApi(Build.VERSION_CODES.Q) // Mark function as requiring Q or higher
-    private fun moveImagesToFolder(folderUri: Uri) {
-        Log.d("SearchFragment", "moveImagesToFolder started (Strategy 1: Update RELATIVE_PATH)")
-        val selectedIds = selectionTracker.selection.toList()
-        if (selectedIds.isEmpty()) {
-            Log.d("SearchFragment", "No images selected for move.")
+        val embeddingsToProcess = getEmbeddingsForIds(selectedInternalIds)
+        if (embeddingsToProcess.isEmpty()) {
+            Toast.makeText(context, "Could not find data for selected items.", Toast.LENGTH_SHORT).show()
             return
         }
 
         val contentResolver = requireContext().contentResolver
-        val movedIds = Collections.synchronizedList(mutableListOf<Long>()) // Keep thread-safe list
-        val completionCounter = AtomicInteger(selectedIds.size) // Keep completion counter
+        val mediaStoreItems = mutableListOf<Pair<Uri, Long>>() // Pair(SourceUri, InternalId)
+        val documentFileItems = mutableListOf<Pair<Uri, Long>>() // Pair(SourceUri, InternalId)
+        var mediaStoreRequestLaunched = false // Track if MediaStore prompt is shown
 
-        // **Crucial Step**: Get the relative path for MediaStore from the chosen folder URI
-        // This conversion can be complex and depends on where the user can pick folders.
-        // This is a placeholder - you'll need a robust way to implement getRelativePathFromTreeUri.
-        val targetRelativePath = getRelativePathFromTreeUri(requireContext(), folderUri)
+        // --- 1. Separate items by source type ---
+        embeddingsToProcess.forEach { embedding ->
+            determineUriFromEmbedding(embedding)?.let { sourceUri ->
+                val authority = sourceUri.authority
+                if (DocumentsContract.isDocumentUri(requireContext(), sourceUri) ||
+                    authority?.contains("com.android.externalstorage.documents") == true) {
+                    documentFileItems.add(Pair(sourceUri, embedding.internalId))
+                } else if ("media".equals(authority, ignoreCase = true)) {
+                    mediaStoreItems.add(Pair(sourceUri, embedding.internalId))
+                } else {
+                    Log.w("SearchFragment", "Unknown URI type in move: $sourceUri")
+                }
+            } ?: Log.w("SearchFragment", "Could not determine source URI for internalId ${embedding.internalId}")
+        }
+        Log.d("SearchFragment", "Separated items - MediaStore: ${mediaStoreItems.size}, DocumentFile: ${documentFileItems.size}")
 
-        if (targetRelativePath == null) {
-            Toast.makeText(context, "Could not determine a valid MediaStore path for the selected folder.", Toast.LENGTH_LONG).show()
-            Log.e("SearchFragment", "Failed to get relative path from folderUri: $folderUri")
-            return // Cannot proceed without a valid relative path
+
+        // --- 2. Handle MediaStore items (Request Permission via IntentSender) ---
+        if (mediaStoreItems.isNotEmpty()) {
+            val mediaStoreUrisToModify = mediaStoreItems.map { it.first }
+            Log.d("SearchFragment", "Requesting write permission for ${mediaStoreUrisToModify.size} MediaStore URIs.")
+            try {
+                // Use createWriteRequest for API 29+ as it's the standard way to request modification permission
+                val pendingIntent: PendingIntent = MediaStore.createWriteRequest(contentResolver, mediaStoreUrisToModify)
+
+                if (pendingIntent != null) {
+                    val intentSenderRequest = IntentSenderRequest.Builder(pendingIntent).build()
+                    pendingMediaStoreMoveItems = mediaStoreItems
+                    pendingMoveDestinationUri = destinationFolderUri
+                    modifyPermissionLauncher.launch(intentSenderRequest)
+                    mediaStoreRequestLaunched = true
+                } else {
+                    Log.e("SearchFragment", "MediaStore.createWriteRequest returned null.")
+                    Toast.makeText(context, "Failed to create permission request.", Toast.LENGTH_SHORT).show()
+                    handleMoveCompletion(emptyList(), mediaStoreItems.map { it.second })
+                }
+
+            } catch (e: Exception) {
+                Log.e("SearchFragment", "Error creating or launching write request for MediaStore items", e)
+                Toast.makeText(context, "Failed to request permission for MediaStore items.", Toast.LENGTH_SHORT).show()
+                handleMoveCompletion(emptyList(), mediaStoreItems.map { it.second })
+            }
         }
 
-        Log.d("SearchFragment", "Target MediaStore Relative Path: $targetRelativePath")
+        // --- 3. Handle DocumentFile items ---
+        if (documentFileItems.isNotEmpty()) {
+            Log.d("SearchFragment", "Processing ${documentFileItems.size} DocumentFile items for move.")
+            val destinationDirDocFile = DocumentFile.fromTreeUri(requireContext(), destinationFolderUri)
 
-        selectedIds.forEach { imageId ->
-            val sourceUri = Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, imageId.toString())
-            val values = ContentValues()
+            if (destinationDirDocFile == null || !destinationDirDocFile.isDirectory || !destinationDirDocFile.canWrite()) {
+                Log.e("SearchFragment", "Invalid or non-writable destination folder URI: $destinationFolderUri")
+                Toast.makeText(context, "Cannot write to the selected destination folder.", Toast.LENGTH_LONG).show()
+                handleMoveCompletion(emptyList(), documentFileItems.map { it.second })
+            } else {
+                // Launch background task for file operations
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val successfullyMovedDocIds = mutableListOf<Long>()
+                    val failedDocIds = mutableListOf<Long>()
 
-            // Prepare the ContentValues for the update operation
-            values.put(MediaStore.MediaColumns.RELATIVE_PATH, targetRelativePath)
-            // Optional: If you want to rename the file during the move
-            // val originalDisplayName = getDisplayName(contentResolver, sourceUri) // Need a helper function for this
-            // if (originalDisplayName != null) {
-            //    values.put(MediaStore.MediaColumns.DISPLAY_NAME, "moved_$originalDisplayName")
-            // }
+                    documentFileItems.forEach { (sourceUri, internalId) ->
+                        try {
+                            val sourceDocFile = DocumentFile.fromSingleUri(requireContext(), sourceUri)
+                            if (sourceDocFile == null || !sourceDocFile.exists()) {
+                                Log.w("SearchFragment", "Source DocumentFile not found or accessible: $sourceUri")
+                                failedDocIds.add(internalId)
+                                return@forEach
+                            }
 
-            // IMPORTANT: On Android R (API 30) and later, MediaStore *might* automatically
-            // set IS_PENDING to 1 during the update. It *should* clear it upon success,
-            // but it's sometimes necessary to clear it manually *after* the update if issues arise.
-            // For simplicity, we'll rely on the system first. If metadata/visibility issues
-            // persist, a second update might be needed:
-            // val pendingValues = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
-            // contentResolver.update(sourceUri, pendingValues, null, null) // Call after successful move
+                            val sourceFileName = sourceDocFile.name ?: "file_${System.currentTimeMillis()}"
+                            var moved = false
 
-            try {
-                // Perform the update
-                val updatedRows = contentResolver.update(sourceUri, values, null, null)
+                            // Attempt DocumentsContract.moveDocument (API 24+)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                                try {
+                                    val sourceParentUri = sourceDocFile.parentFile?.uri ?: kotlin.run {
+                                        try { DocumentsContract.buildDocumentUriUsingTree(sourceUri, DocumentsContract.getTreeDocumentId(sourceUri).substringBeforeLast('/')) }
+                                        catch (e: Exception) { null }
+                                    } ?: destinationDirDocFile.uri // Fallback
 
-                if (updatedRows > 0) {
-                    Log.d("SearchFragment", "Successfully updated RELATIVE_PATH for $sourceUri to $targetRelativePath")
-                    movedIds.add(imageId) // Mark as successfully moved
-                } else {
-                    Log.w("SearchFragment", "Failed to update RELATIVE_PATH for $sourceUri (rows updated: $updatedRows)")
-                    Toast.makeText(context, "Failed to move image ID: $imageId", Toast.LENGTH_SHORT).show()
+                                    val movedUri = DocumentsContract.moveDocument(
+                                        contentResolver, sourceUri, sourceParentUri, destinationDirDocFile.uri
+                                    )
+                                    moved = (movedUri != null)
+                                    if (moved) Log.d("SearchFragment", "Moved using DocumentsContract.moveDocument: $sourceFileName to $movedUri")
+                                    else Log.w("SearchFragment", "DocumentsContract.moveDocument returned null for: $sourceFileName")
+                                } catch (e: Exception) {
+                                    Log.w("SearchFragment", "DocumentsContract.moveDocument failed for $sourceFileName, falling back to copy/delete.", e)
+                                    moved = false
+                                }
+                            }
+
+                            // Fallback to Copy/Delete
+                            if (!moved) {
+                                Log.d("SearchFragment", "Attempting copy/delete for: $sourceFileName")
+                                var targetFileName = sourceFileName
+                                var counter = 1
+                                while (destinationDirDocFile.findFile(targetFileName)?.exists() == true) {
+                                    val nameWithoutExtension = sourceFileName.substringBeforeLast('.', sourceFileName)
+                                    val extension = sourceFileName.substringAfterLast('.', "")
+                                    targetFileName = if (extension.isNotEmpty()) "${nameWithoutExtension}_${counter}.${extension}" else "${nameWithoutExtension}_${counter}"
+                                    counter++
+                                }
+
+                                val copiedFile = destinationDirDocFile.createFile(sourceDocFile.type ?: "application/octet-stream", targetFileName)
+
+                                if (copiedFile != null) {
+                                    var success = false
+                                    try {
+                                        contentResolver.openInputStream(sourceUri)?.use { inputStream ->
+                                            contentResolver.openOutputStream(copiedFile.uri)?.use { outputStream ->
+                                                inputStream.copyTo(outputStream); success = true
+                                            }
+                                        }
+                                        if (success) {
+                                            Log.d("SearchFragment", "Successfully copied: $sourceFileName to ${copiedFile.name}")
+                                            if (sourceDocFile.delete()) {
+                                                Log.d("SearchFragment", "Successfully deleted original: $sourceFileName"); moved = true
+                                            } else {
+                                                Log.w("SearchFragment", "Failed to delete original after copy: $sourceFileName"); copiedFile.delete(); moved = false
+                                            }
+                                        } else {
+                                            Log.e("SearchFragment", "Copy failed (streams) for: $sourceFileName"); copiedFile.delete(); moved = false
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.e("SearchFragment", "Exception during copy/delete for $sourceFileName", e)
+                                        try { copiedFile.delete() } catch (delEx: Exception) { Log.e("SearchFragment", "Failed to cleanup partially copied file", delEx)}
+                                        moved = false
+                                    }
+                                } else {
+                                    Log.e("SearchFragment", "Failed to create target file in destination: $targetFileName"); moved = false
+                                }
+                            }
+
+                            if (moved) successfullyMovedDocIds.add(internalId) else failedDocIds.add(internalId)
+
+                        } catch (e: Exception) {
+                            Log.e("SearchFragment", "Error processing DocumentFile item (internalId: $internalId, uri: $sourceUri)", e)
+                            failedDocIds.add(internalId)
+                        }
+                    } // End forEach loop
+
+                    withContext(Dispatchers.Main) {
+                        Log.d("SearchFragment", "DocumentFile move completed. Success: ${successfullyMovedDocIds.size}, Failed: ${failedDocIds.size}")
+                        handleMoveCompletion(successfullyMovedDocIds, failedDocIds)
+
+                        // Show toast only if ONLY DocumentFile operations happened
+                        if (!mediaStoreRequestLaunched) {
+                            val message = buildString {
+                                if (successfullyMovedDocIds.isNotEmpty()) append("${successfullyMovedDocIds.size} files moved. ")
+                                if (failedDocIds.isNotEmpty()) append("${failedDocIds.size} files failed.")
+                            }
+                            if (message.isNotBlank()) Toast.makeText(context, message.trim(), Toast.LENGTH_LONG).show()
+                            // Selection cleared in handleMoveCompletion
+                        }
+                    }
+                } // End lifecycleScope.launch(Dispatchers.IO)
+            } // End else (destination is valid)
+        } // End if (documentFileItems.isNotEmpty())
+    }
+
+    // --- Function to perform the actual MediaStore move (called after permission granted) ---
+    private fun performMediaStoreMove(itemsToMove: List<Pair<Uri, Long>>, destinationFolderUri: Uri) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val successfullyMovedIds = mutableListOf<Long>()
+            val failedIds = mutableListOf<Long>()
+            val contentResolver = requireContext().contentResolver
+
+            // Try to get a relative path suitable for MediaStore (API 29+)
+            // This might fail if the destination is not a standard MediaStore location
+            val relativePath = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                getRelativePathFromTreeUri(requireContext(), destinationFolderUri)
+            } else {
+                null // Relative path not applicable below Q for MediaStore moves this way
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && relativePath != null) {
+                // --- Use MediaStore API (ContentResolver.update) for API 29+ ---
+                Log.d("SearchFragment", "Attempting MediaStore move using relativePath: $relativePath")
+                itemsToMove.forEach { (sourceUri, internalId) ->
+                    try {
+                        val values = ContentValues().apply {
+                            put(MediaStore.Images.Media.IS_PENDING, 1) // Mark as pending
+                        }
+                        // Mark as pending first
+                        contentResolver.update(sourceUri, values, null, null)
+                        values.clear()
+                        // Set the new relative path and clear pending status
+                        values.apply {
+                            put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
+                            put(MediaStore.Images.Media.IS_PENDING, 0)
+                        }
+                        val updatedRows = contentResolver.update(sourceUri, values, null, null)
+                        if (updatedRows > 0) {
+                            Log.d("SearchFragment", "MediaStore update successful for ID: $internalId")
+                            successfullyMovedIds.add(internalId)
+                        } else {
+                            Log.w("SearchFragment", "MediaStore update failed (0 rows) for ID: $internalId. Trying copy/delete fallback.")
+                            // Attempt copy/delete as fallback if update fails
+                            if (copyAndDeleteSaf(sourceUri, destinationFolderUri, contentResolver)) {
+                                successfullyMovedIds.add(internalId)
+                            } else {
+                                failedIds.add(internalId)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e("SearchFragment", "Error moving MediaStore item (ID: $internalId) via update. Trying copy/delete.", e)
+                        // Attempt copy/delete as fallback on exception
+                        if (copyAndDeleteSaf(sourceUri, destinationFolderUri, contentResolver)) {
+                            successfullyMovedIds.add(internalId)
+                        } else {
+                            failedIds.add(internalId)
+                        }
+                    }
                 }
-
-            } catch (securityException: SecurityException) {
-                // Handle potential SecurityExceptions, especially RecoverableSecurityException on R+
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && securityException is RecoverableSecurityException) {
-                    Log.e("SearchFragment", "RecoverableSecurityException for $sourceUri", securityException)
-                    // You need an ActivityResultLauncher prepared to handle IntentSender requests
-                    // val intentSenderRequest = IntentSenderRequest.Builder(securityException.userAction.actionIntent.intentSender).build()
-                    // recoverableSecurityExceptionLauncher.launch(intentSenderRequest) // Launch the prompt
-                    // For now, just notify the user permission is needed. The move for this file failed.
-                    Toast.makeText(context, "Permission needed to move file $imageId", Toast.LENGTH_LONG).show()
-
+            } else {
+                // --- Fallback to Copy/Delete for API < 29 or if relativePath is invalid ---
+                Log.d("SearchFragment", "Falling back to copy/delete for MediaStore items (API < 29 or invalid destination path).")
+                val destinationDirDocFile = DocumentFile.fromTreeUri(requireContext(), destinationFolderUri)
+                if (destinationDirDocFile == null || !destinationDirDocFile.canWrite()) {
+                    Log.e("SearchFragment", "Cannot write to destination folder for copy/delete fallback.")
+                    failedIds.addAll(itemsToMove.map { it.second }) // Mark all as failed
                 } else {
-                    Log.e("SearchFragment", "SecurityException moving file $imageId via update", securityException)
-                    Toast.makeText(context, "Permission error moving file $imageId", Toast.LENGTH_SHORT).show()
-                }
-            } catch (e: Exception) {
-                // Catch other potential exceptions during the update
-                Log.e("SearchFragment", "Error moving file $imageId via update", e)
-                Toast.makeText(context, "Error moving file $imageId", Toast.LENGTH_SHORT).show()
-            } finally {
-                // Decrement counter regardless of success/failure for this file
-                // and check if all operations are done to update UI
-                if (completionCounter.decrementAndGet() == 0) {
-                    activity?.runOnUiThread { finalizeMove(movedIds) }
+                    itemsToMove.forEach { (sourceUri, internalId) ->
+                        if (copyAndDeleteSaf(sourceUri, destinationFolderUri, contentResolver)) {
+                            successfullyMovedIds.add(internalId)
+                        } else {
+                            failedIds.add(internalId)
+                        }
+                    }
                 }
             }
-        } // End of forEach loop
 
-        // Initial check in case the list was empty or path was invalid
-        if (selectedIds.isEmpty() || targetRelativePath == null) {
-            finalizeMove(movedIds) // Update UI even if nothing was processed
+            // Call completion handler on the main thread
+            withContext(Dispatchers.Main) {
+                handleMoveCompletion(successfullyMovedIds, failedIds)
+            }
+        }
+    }
+
+    // --- Helper for SAF Copy/Delete (can be used by both MediaStore fallback and DocumentFile) ---
+    private fun copyAndDeleteSaf(sourceUri: Uri, destinationTreeUri: Uri, contentResolver: ContentResolver): Boolean {
+        val destinationDir = DocumentFile.fromTreeUri(requireContext(), destinationTreeUri)
+        if (destinationDir == null || !destinationDir.canWrite()) return false
+
+        var sourceFileName: String? = null
+        // Try getting name via ContentResolver first
+        try {
+            contentResolver.query(sourceUri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    sourceFileName = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME))
+                }
+            }
+        } catch (e: Exception) { Log.w("SearchFragment", "Could not get display name via query for $sourceUri", e)}
+
+        // Fallback: Try getting name via DocumentFile if it's a document URI
+        if (sourceFileName == null && DocumentsContract.isDocumentUri(requireContext(), sourceUri)) {
+            sourceFileName = DocumentFile.fromSingleUri(requireContext(), sourceUri)?.name
+        }
+        // Final fallback name
+        sourceFileName = sourceFileName ?: "file_${System.currentTimeMillis()}"
+
+        // Handle potential name collisions
+        var targetFileName = sourceFileName!!
+        var counter = 1
+        while (destinationDir.findFile(targetFileName)?.exists() == true) {
+            val nameWithoutExtension = sourceFileName!!.substringBeforeLast('.', sourceFileName!!)
+            val extension = sourceFileName!!.substringAfterLast('.', "")
+            targetFileName = if (extension.isNotEmpty()) "${nameWithoutExtension}_${counter}.${extension}" else "${nameWithoutExtension}_${counter}"
+            counter++
+        }
+
+        // Determine MIME type
+        val mimeType = contentResolver.getType(sourceUri) ?: "application/octet-stream"
+
+        // Create target file
+        val copiedFile = destinationDir.createFile(mimeType, targetFileName) ?: return false
+
+        // Perform copy
+        var success = false
+        try {
+            contentResolver.openInputStream(sourceUri)?.use { inputStream ->
+                contentResolver.openOutputStream(copiedFile.uri)?.use { outputStream ->
+                    inputStream.copyTo(outputStream); success = true
+                }
+            }
+            if (success) {
+                // Delete original AFTER successful copy
+                val deleted = try {
+                    // Use appropriate delete method based on URI type
+                    if (DocumentsContract.isDocumentUri(requireContext(), sourceUri)) {
+                        DocumentsContract.deleteDocument(contentResolver, sourceUri)
+                    } else { // Assume MediaStore or other Content URI
+                        contentResolver.delete(sourceUri, null, null) > 0
+                    }
+                } catch (delEx: Exception) {
+                    Log.e("SearchFragment", "Exception deleting original $sourceUri after copy", delEx)
+                    false
+                }
+
+                if (!deleted) {
+                    Log.w("SearchFragment", "Failed to delete original $sourceUri after copy.")
+                    copiedFile.delete() // Clean up copied file if original couldn't be deleted
+                    return false // Consider move failed if delete fails
+                }
+                Log.d("SearchFragment", "Successfully copied and deleted $sourceUri")
+                return true // Move succeeded
+            } else {
+                Log.e("SearchFragment", "Copy failed (streams) for: $sourceUri")
+                copiedFile.delete() // Clean up failed copy
+                return false
+            }
+        } catch (e: Exception) {
+            Log.e("SearchFragment", "Exception during copy/delete for $sourceUri", e)
+            try { copiedFile.delete() } catch (delEx: Exception) { /* Ignore cleanup error */ }
+            return false
+        }
+    }
+
+    // --- Placeholder for handling completion ---
+    private fun handleMoveCompletion(movedInternalIds: List<Long>, failedInternalIds: List<Long>) {
+        // --- 1. Update Database/ViewModel ---
+        if (movedInternalIds.isNotEmpty()) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                Log.d("SearchFragment", "Calling ViewModel to update moved internal IDs in DB: $movedInternalIds")
+                movedInternalIds.forEach { internalId ->
+                    mORTImageViewModel.embeddingMoved(internalId = internalId, newTimestamp = System.currentTimeMillis())
+                }
+                Log.d("SearchFragment", "ViewModel update calls completed for moved items.")
+
+                // --- 2. Update SearchViewModel's list ---
+                val currentSearchResults = mSearchViewModel.searchResults ?: emptyList()
+                val remainingIds = currentSearchResults.filter { it !in movedInternalIds }
+                withContext(Dispatchers.Main) {
+                    mSearchViewModel.searchResults = remainingIds
+                    Log.d("SearchFragment", "SearchViewModel searchResults updated. New size: ${mSearchViewModel.searchResults?.size}")
+                    // Trigger UI update AFTER SearchViewModel is updated
+                    updateAdapterAfterModification(movedInternalIds, failedInternalIds)
+                }
+            }
+        } else {
+            // Still update UI for failures/selection clear even if nothing moved
+            updateAdapterAfterModification(movedInternalIds, failedInternalIds)
+        }
+    }
+
+    /**
+     * Helper function to update the adapter and show toasts on the Main thread
+     * after Move or Delete operations have affected the underlying data.
+     * Also clears selection.
+     */
+    private fun updateAdapterAfterModification(successfulIds: List<Long>, failedIds: List<Long>) {
+        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.Main) {
+            var uiRefreshed = false
+            // Always refresh the adapter if the operation involved any items
+            if (successfulIds.isNotEmpty() || failedIds.isNotEmpty()) {
+                val updatedEmbeddingList = getEmbeddingsForIds(mSearchViewModel.searchResults ?: emptyList())
+                Log.d("SearchFragment", "Updating adapter after modification. New list size: ${updatedEmbeddingList.size}")
+                if (::imageAdapter.isInitialized) {
+                    imageAdapter.updateData(updatedEmbeddingList)
+                    uiRefreshed = true
+                } else {
+                    Log.w("SearchFragment", "Adapter not initialized in updateAdapterAfterModification")
+                }
+            }
+
+            // Clear selection tracker state AFTER the operation completes (success or fail)
+            if (::selectionTracker.isInitialized) {
+                selectionTracker.clearSelection()
+                Log.d("SearchFragment", "Selection tracker cleared after modification.")
+                // ViewModel selection state is cleared by the observer automatically
+            }
+
+
+            // Show combined Toast message
+            val successCount = successfulIds.size
+            val failCount = failedIds.size
+            var toastMessage = ""
+            listCount = mSearchViewModel.searchResults?.size!!
+            selectedCountTextView?.text = "$listCount Images"
+            // Customize message based on operation (Move vs Delete) - requires knowing context
+            // For now, using generic "processed"
+            if (successCount > 0) {
+                toastMessage += "$successCount processed. "
+            }
+            if (failCount > 0) {
+                toastMessage += "$failCount failed."
+            }
+            if (toastMessage.isNotBlank()) {
+                Toast.makeText(context, toastMessage.trim(), Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -455,70 +914,36 @@ class SearchFragment : Fragment() {
 
         // Get the document ID from the tree URI
         val documentId = DocumentsContract.getTreeDocumentId(treeUri) ?: return null
-        // Example documentId: "primary:Pictures/MyFolder" or "1234-5678:DCIM/Vacation"
-
         val parts = documentId.split(":", limit = 2)
         if (parts.size != 2) {
             Log.e("getRelativePath", "Could not split document ID: $documentId")
-            return null // Unexpected format
+            return null
         }
 
-        val type = parts[0] // e.g., "primary" or "1234-5678" (volume identifier)
-        val path = parts[1] // e.g., "Pictures/MyFolder" or "DCIM/Vacation"
-
+        val type = parts[0]
+        val path = parts[1]
         Log.d("getRelativePath", "Extracted Path: $path from Document ID: $documentId")
 
-        // Validate if the path starts with a standard public directory MediaStore recognizes well.
-        // This is crucial because RELATIVE_PATH works best with these.
         val standardDirs = listOf(
-            Environment.DIRECTORY_PICTURES,
-            Environment.DIRECTORY_DCIM,
-            Environment.DIRECTORY_MOVIES,
-            Environment.DIRECTORY_MUSIC,
-            Environment.DIRECTORY_DOWNLOADS,
-            Environment.DIRECTORY_DOCUMENTS
-            // Add others if needed
+            Environment.DIRECTORY_PICTURES, Environment.DIRECTORY_DCIM, Environment.DIRECTORY_MOVIES,
+            Environment.DIRECTORY_MUSIC, Environment.DIRECTORY_DOWNLOADS, Environment.DIRECTORY_DOCUMENTS
         )
 
         var isValidPrefix = false
         for (dir in standardDirs) {
             if (path.startsWith(dir, ignoreCase = true)) {
-                isValidPrefix = true
-                break
+                isValidPrefix = true; break
             }
         }
 
         if (!isValidPrefix) {
-            // If the selected folder is not inside a standard directory (e.g., root of SD card),
-            // using RELATIVE_PATH might be problematic or not work as expected.
-            // You might need a different strategy or restrict folder selection.
             Log.w("getRelativePath", "Path '$path' does not start with a standard MediaStore directory.")
-            // Returning null here enforces moving only to standard locations.
-            // Alternatively, you could try returning just the path, but it might fail.
-            return null
+            return null // Enforce moving only to standard locations for MediaStore API
         }
 
-        // Ensure the path ends with a forward slash '/' as required by RELATIVE_PATH
-        return if (path.endsWith(File.separator)) {
-            path
-        } else {
-            "$path/"
-        }
-        // Example valid return values: "Pictures/MyFolder/", "DCIM/Vacation/"
+        // Ensure the path ends with a forward slash '/'
+        return if (path.endsWith(File.separator)) path else "$path/"
     }
-
-    private fun finalizeMove(movedIds: List<Long>) {
-        Log.d("SearchFragment", "Finalizing move operation. Moved count: ${movedIds.size}")
-        val currentDataset = imageAdapter.getDataset()
-        val newDataset = currentDataset.filter { !movedIds.contains(it) }
-        imageAdapter.updateData(newDataset)
-        selectionTracker.clearSelection()
-        if (movedIds.isNotEmpty()) { // Only show toast if something was actually moved
-            Toast.makeText(context, "${movedIds.size} images moved", Toast.LENGTH_SHORT).show()
-        }
-        // Hide progress indicator if any
-    }
-
 
     // Optional Helper: You might need this if renaming files
     private fun getDisplayName(contentResolver: ContentResolver, uri: Uri): String? {
@@ -534,173 +959,183 @@ class SearchFragment : Fragment() {
         }
         return displayName
     }
+
     // Show alert dialog before deletion
-    private fun showDeleteConfirmationDialog(selectedIds: List<Long>) {
-        val itemCount = selectedIds.size
-        // Determine message based on API level (Trash vs. Permanent)
+    private fun showDeleteConfirmationDialog(selectedIdsInternal: List<Long>) {
+        val itemCount = selectedIdsInternal.size
         val message = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            "Are you sure you want to move $itemCount selected image(s) to the trash?" // API 30+ message
+            "Are you sure you want to move $itemCount selected image(s) to the trash?"
         } else {
-            "Are you sure you want to permanently delete $itemCount selected image(s)? This action cannot be undone." // Pre-API 30 message
+            "Are you sure you want to permanently delete $itemCount selected image(s)? This action cannot be undone."
         }
 
-        // Use MaterialAlertDialogBuilder if using Material Components theme (recommended)
         AlertDialog.Builder(requireContext())
             .setTitle("Confirm Deletion")
             .setMessage(message)
             .setPositiveButton("Delete") { dialog, which ->
-                // User clicked DELETE - now proceed with the actual deletion
                 Log.d("SearchFragment", "User confirmed deletion for $itemCount items.")
-                initiateMediaStoreDeletion(selectedIds) // Call the function that starts the deletion process
+                initiateMediaStoreDeletion(selectedIdsInternal)
             }
             .setNegativeButton("Cancel") { dialog, which ->
-                // User clicked Cancel - do nothing, just dismiss dialog
                 Log.d("SearchFragment", "User cancelled deletion.")
                 dialog.dismiss()
             }
-            .show() // Display the dialog
+            .show()
     }
 
-    private fun initiateMediaStoreDeletion(selectedIds: List<Long>) {
-        if (selectedIds.isEmpty()) return // Should be checked before calling, but good practice
+    private fun initiateMediaStoreDeletion(selectedInternalIds: List<Long>) {
+        if (selectedInternalIds.isEmpty()) return
 
         val contentResolver = requireContext().contentResolver
-        val urisToDelete = selectedIds.map { id ->
-            ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+        val embeddingsToDelete = getEmbeddingsForIds(selectedInternalIds)
+        if (embeddingsToDelete.isEmpty()) {
+            Log.w("SearchFragment", "Could not find embedding data for selected internal IDs: $selectedInternalIds")
+            Toast.makeText(context, "Error finding items to delete.", Toast.LENGTH_SHORT).show()
+            return
         }
 
-        // --- Choose method based on API level ---
+        val urisAndIdsToDelete = embeddingsToDelete.mapNotNull { embedding ->
+            determineUriFromEmbedding(embedding)?.let { Pair(it, embedding.internalId) }
+        }
+        if (urisAndIdsToDelete.isEmpty()) {
+            Log.w("SearchFragment", "Could not resolve URIs for selected internal IDs.")
+            Toast.makeText(context, "Error resolving items to delete.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val urisOnly = urisAndIdsToDelete.map { it.first }
+        pendingDeleteIds = urisAndIdsToDelete.map { it.second } // Store IDs for potential callback
+
         when {
-            // --- API 30+ (Android 11+): Use createTrashRequest ---
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
                 try {
-                    // Request to move files to trash (setTrashedState = true)
-                    val pendingIntent = MediaStore.createTrashRequest(contentResolver, urisToDelete, true)
+                    val pendingIntent = MediaStore.createTrashRequest(contentResolver, urisOnly, true)
                     val intentSenderRequest = IntentSenderRequest.Builder(pendingIntent).build()
-
-                    // *** Store the IDs before launching the request ***
-                    pendingDeleteIds = selectedIds
-
-                    // Launch the system dialog using the *same* launcher used for recoverable exceptions
-                    Log.d("SearchFragment", "Launching createTrashRequest for ${urisToDelete.size} items.")
+                    // Store IDs before launching request - already done above
+                    // pendingDeleteIds = selectedInternalIds
+                    Log.d("SearchFragment", "Launching createTrashRequest (API 30+).")
                     deleteResultLauncher.launch(intentSenderRequest)
-                    // The actual DB/UI update will happen in the launcher's result callback IF RESULT_OK
                 } catch (e: Exception) {
                     Log.e("SearchFragment", "Error creating or launching trash request", e)
                     Toast.makeText(context, "Failed to initiate trashing operation.", Toast.LENGTH_SHORT).show()
                     pendingDeleteIds = null // Clear pending IDs on immediate failure
+                    handleSuccessfulDeletion(emptyList(), selectedInternalIds) // Mark all as failed
                 }
             }
-
-            // --- API 29 (Android 10): Use delete() + RecoverableSecurityException ---
-            Build.VERSION.SDK_INT == Build.VERSION_CODES.Q -> {
-                // Store IDs before starting loop
-                pendingDeleteIds = selectedIds
+            // API 29 and below: Use delete loop with RecoverableSecurityException handling
+            else -> { // Covers Q and below
+                // Store IDs before starting loop - already done above
+                // pendingDeleteIds = selectedInternalIds
                 lifecycleScope.launch(Dispatchers.IO) {
-                    handleDeletionLoop(selectedIds, urisToDelete)
-                }
-            }
-
-            // --- API 28 and below: Use delete() (Permanent) ---
-            else -> { // Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
-                lifecycleScope.launch(Dispatchers.IO) {
-                    handleDeletionLoop(selectedIds, urisToDelete)
+                    handleDeletionLoopApi29(urisAndIdsToDelete)
                 }
             }
         }
     }
-    // Helper function for the deletion loop used by API 29 and below
-    // (Moved the loop logic here for clarity)
-    private suspend fun handleDeletionLoop(selectedIds: List<Long>, urisToDelete: List<Uri>) {
+
+    private suspend fun handleDeletionLoopApi29(urisAndIdsToDelete: List<Pair<Uri, Long>>) {
         val contentResolver = requireContext().contentResolver
-        val successfullyDeletedIds = mutableListOf<Long>()
-        val failedIds = mutableListOf<Long>()
-        var requiresPermission = false
+        val successfullyDeletedInternalIds = mutableListOf<Long>()
+        val failedInternalIds = mutableListOf<Long>()
+        var permissionNeededIntentSender: IntentSender? = null
+        var permissionNeededId: Long? = null // Track ID needing permission
 
-        for (i in urisToDelete.indices) {
-            val imageUri = urisToDelete[i]
-            val imageId = selectedIds[i] // Assumes lists are aligned
+        Log.d("DeletionLoop", "Starting loop for ${urisAndIdsToDelete.size} items (API <= 29)")
 
+        for ((imageUri, internalId) in urisAndIdsToDelete) {
             try {
-                val deletedRows = contentResolver.delete(imageUri, null, null)
-                if (deletedRows > 0) {
-                    Log.d("SearchFragment", "Successfully deleted MediaStore (API < 30) ID: $imageId")
-                    successfullyDeletedIds.add(imageId)
-                } else {
-                    Log.w("SearchFragment", "Failed to delete MediaStore (API < 30) ID: $imageId")
-                    failedIds.add(imageId)
-                }
-            } catch (securityException: SecurityException) {
-                // Only handle RecoverableSecurityException on Q (API 29)
-                if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && securityException is RecoverableSecurityException) {
-                    requiresPermission = true
+                Log.d("DeletionLoop", "Attempting delete for InternalID: $internalId, URI: $imageUri")
+                var deleted = false
+                if (DocumentsContract.isDocumentUri(requireContext(), imageUri)) {
                     try {
-                        val intentSenderRequest = IntentSenderRequest.Builder(securityException.userAction.actionIntent.intentSender).build()
-                        // *** Store the *single* ID needing permission (overwrites batch IDs) ***
-                        // Note: This simplistic approach only handles one permission request at a time.
-                        // If multiple files need permission, only the first one will be prompted for.
-                        pendingDeleteIds = listOf(imageId) // Store only the ID causing the exception
-                        Log.d("SearchFragment","RecoverableSecurityException for ID $imageId, launching prompt.")
-                        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.Main) { // Must launch on Main thread
-                            deleteResultLauncher.launch(intentSenderRequest)
-                        }
-                        break
-                    } catch (e: IntentSender.SendIntentException) {
-                        Log.e("SearchFragment", "Failed to launch delete intent sender (API 29) for ID: $imageId", e)
-                        failedIds.add(imageId)
-                        pendingDeleteIds = null // Clear pending IDs on launch failure
+                        deleted = DocumentsContract.deleteDocument(contentResolver, imageUri)
+                        if (!deleted) Log.w("DeletionLoop", "DocumentsContract.deleteDocument returned false for $internalId / $imageUri")
+                    } catch(e: Exception) {
+                        Log.e("DeletionLoop", "Exception deleting document: $imageUri", e)
                     }
-                } else {
-                    // Non-recoverable or pre-Q security exception (likely missing WRITE_EXTERNAL_STORAGE)
-                    Log.e("SearchFragment", "SecurityException (non-recoverable or API < 29) deleting ID: $imageId", securityException)
-                    failedIds.add(imageId)
+                } else { // Assume MediaStore or other Content URI
+                    try {
+                        val deletedRows = contentResolver.delete(imageUri, null, null)
+                        deleted = deletedRows > 0
+                    } catch (secEx: SecurityException) {
+                        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && secEx is RecoverableSecurityException) {
+                            Log.w("DeletionLoop", "RecoverableSecurityException for MediaStore InternalID $internalId", secEx)
+                            if (permissionNeededIntentSender == null) { // Store first encountered
+                                permissionNeededIntentSender = secEx.userAction.actionIntent.intentSender
+                                permissionNeededId = internalId
+                            }
+                            // Mark as failed for now, let prompt handle retry
+                        } else {
+                            throw secEx // Re-throw other security exceptions
+                        }
+                    }
                 }
+
+                if (deleted) {
+                    Log.d("DeletionLoop", "Successfully deleted item for InternalID: $internalId")
+                    successfullyDeletedInternalIds.add(internalId)
+                } else {
+                    // Add to failed list ONLY IF no permission prompt was triggered for it
+                    if (internalId != permissionNeededId) {
+                        Log.w("DeletionLoop", "Failed to delete item for InternalID: $internalId (URI: $imageUri)")
+                        failedInternalIds.add(internalId)
+                    } else {
+                        Log.w("DeletionLoop", "Deletion pending permission for InternalID: $internalId")
+                        // Don't add to failed list yet, wait for permission result
+                    }
+                }
+
             } catch (e: Exception) {
-                Log.e("SearchFragment", "Error deleting ID: $imageId", e)
-                failedIds.add(imageId)
+                Log.e("DeletionLoop", "Outer error processing delete for InternalID: $internalId", e)
+                failedInternalIds.add(internalId) // Ensure added to failed list on any outer exception
             }
         } // End loop
 
-        // If we completed the loop without needing permission, finalize the successful deletions
-        if (!requiresPermission) {
-            pendingDeleteIds = null // Clear pending IDs as the batch completed normally
-            handleSuccessfulDeletion(successfullyDeletedIds, failedIds)
+        Log.d("DeletionLoop", "Loop finished. Success: ${successfullyDeletedInternalIds.size}, Fail: ${failedInternalIds.size}, Permission Prompt needed: ${permissionNeededIntentSender != null}")
+
+        // --- Post-Loop Processing ---
+        if (permissionNeededIntentSender != null && permissionNeededId != null) {
+            try {
+                val intentSenderRequest = IntentSenderRequest.Builder(permissionNeededIntentSender).build()
+                // Store only the ID for which permission was requested
+                // Overwrite pendingDeleteIds which might contain all initial IDs
+                pendingDeleteIds = listOf(permissionNeededId)
+                Log.d("DeletionLoop", "Launching prompt for the first file needing permission (InternalID: $permissionNeededId)")
+                // Launch on Main thread
+                withContext(Dispatchers.Main) {
+                    deleteResultLauncher.launch(intentSenderRequest)
+                }
+            } catch (e: Exception) { // Catch SendIntentException or others
+                Log.e("DeletionLoop", "Failed to launch delete intent sender for ID: $permissionNeededId", e)
+                pendingDeleteIds = null // Clear pending IDs on launch failure
+                failedInternalIds.add(permissionNeededId) // Mark the item requiring permission as failed now
+            }
+        } else {
+            // No permission prompt was needed, clear any potentially stale pending IDs
+            pendingDeleteIds = null
         }
+
+        // Finalize successes/failures that didn't require a prompt *now*
+        handleSuccessfulDeletion(successfullyDeletedInternalIds, failedInternalIds)
     }
 
-    private fun handleSuccessfulDeletion(successfullyDeletedIds: List<Long>, failedIds: List<Long>){
-        // After (successful) MediaStore deletions, notify ViewModel and update UI
-        if (successfullyDeletedIds.isNotEmpty()) {
-            // Call the ViewModel function (on IO thread)
-            mORTImageViewModel.handleSuccessfulDeletions(successfullyDeletedIds)
+    private fun handleSuccessfulDeletion(successfullyDeletedInternalIds: List<Long>, failedInternalIds: List<Long>){
+        Log.d("SearchFragment", "handleSuccessfulDeletion: Success count=${successfullyDeletedInternalIds.size}, Fail count=${failedInternalIds.size}")
 
-            // Update UI on the main thread (using viewLifecycleOwner)
-            viewLifecycleOwner.lifecycleScope.launch(Dispatchers.Main) {
-                // mSearchViewModel.searchResults should be updated by the view model.
-                Log.d("SearchFragment", "Updating UI directly after deletion request.")
-
-                // Get the currently displayed list (might be search results or full list)
-                val currentDisplayedList = mSearchViewModel.searchResults ?: mORTImageViewModel.idxList.reversed() // Or however you get the default list
-
-                // Create the new list for the adapter by filtering out deleted items
-                val newListForAdapter = currentDisplayedList.filter { it !in successfullyDeletedIds }
-
-                // Update the SearchViewModel's cache as well (important!)
-                mSearchViewModel.searchResults = newListForAdapter
-
-
-                imageAdapter.updateData(newListForAdapter)  // Use emptyList() as a safe default
-
-                selectionTracker.clearSelection()
-
-                Toast.makeText(context, "${successfullyDeletedIds.size} images deleted", Toast.LENGTH_SHORT).show()
+        if (successfullyDeletedInternalIds.isNotEmpty()) {
+            // 1. Call ViewModel to update DB and its internal lists
+            lifecycleScope.launch(Dispatchers.IO) {
+                mORTImageViewModel.deleteEmbeddingsByInternalId(successfullyDeletedInternalIds)
             }
+
+            // 2. Update SearchViewModel's result list (filter out successful ones)
+            val currentSearchResults = mSearchViewModel.searchResults ?: emptyList()
+            mSearchViewModel.searchResults = currentSearchResults.filter { it !in successfullyDeletedInternalIds }
+
         }
-        if(failedIds.isNotEmpty()){
-            viewLifecycleOwner.lifecycleScope.launch(Dispatchers.Main){
-                Toast.makeText(context, "${failedIds.size} images failed to delete", Toast.LENGTH_SHORT).show()
-            }
-        }
+
+        // 3. Update UI on Main Thread (Now handled by updateAdapterAfterModification)
+        updateAdapterAfterModification(successfullyDeletedInternalIds, failedInternalIds) // Call helper
     }
 
     private fun addSelectionObserver() {
@@ -709,9 +1144,9 @@ class SearchFragment : Fragment() {
             override fun onSelectionChanged() {
                 super.onSelectionChanged()
                 Log.d("SelectionState", "Observer onSelectionChanged triggered.")
-                // *** SAVE current selection to ViewModel ***
-                mSearchViewModel.saveSelection(selectionTracker.selection.map { it }.toSet())
-                // Update UI based on the NEW selection state
+                val currentSelection = selectionTracker.selection.map { it }.toSet()
+                mSearchViewModel.saveSelection(currentSelection)
+                Log.d("SelectionState", "Saved selection to ViewModel. Count: ${currentSelection.size}")
                 updateSelectionUi()
             }
         })
@@ -723,42 +1158,76 @@ class SearchFragment : Fragment() {
 
         val selectedCount = selectionTracker.selection.size()
         val hasSelection = selectedCount > 0
-
+        val lsCount = listCount;
         Log.d("SelectionUI", "Updating UI. Count: $selectedCount, HasSelection: $hasSelection")
 
-        // Use safe calls (?.) in case views aren't ready yet, though they should be in onViewCreated
         moveButton?.visibility = if (hasSelection) View.VISIBLE else View.GONE
-        deleteButton.visibility = if (hasSelection) View.VISIBLE else View.GONE
-        selectedCountTextView?.visibility = if (hasSelection) View.VISIBLE else View.GONE
+        deleteButton?.visibility = if (hasSelection) View.VISIBLE else View.GONE
+        //selectedCountTextView?.visibility = if (hasSelection) View.VISIBLE else View.GONE
         if (hasSelection) {
-            selectedCountTextView?.text = "$selectedCount items selected"
+            selectedCountTextView?.text = "$selectedCount/$lsCount items selected"
         }else {
-            selectedCountTextView?.visibility = View.GONE
+
+            selectedCountTextView?.text = "$lsCount Images" // Clear text when not visible
+            // selectedCountTextView?.visibility = View.GONE // Visibility handled above
         }
     }
 
     @RequiresApi(Build.VERSION_CODES.R)
     private fun setupPermissionChecksAndButtons() {
-        // Initial permission check
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (!Environment.isExternalStorageManager()) {
-                Toast.makeText(context, "Full storage access required - redirecting to settings", Toast.LENGTH_LONG).show()
-                requestFullStoragePermission()
-            } else {
-                Log.d("SearchFragment", "Full storage access already granted")
-                moveButton?.isEnabled = true
-            }
+        // Check permission status and update button state accordingly
+        if (hasStoragePermission()) {
+            Log.d("SearchFragment", "Storage permission already granted.")
+            moveButton?.isEnabled = true
         } else {
-            if (!checkStoragePermissions()) {
-                Toast.makeText(context, "Storage permissions required", Toast.LENGTH_LONG).show()
-                requestStoragePermissions()
-            } else {
-                Log.d("SearchFragment", "Storage permissions already granted")
-                moveButton?.isEnabled = true
-            }
+            Log.d("SearchFragment", "Storage permission NOT granted.")
+            moveButton?.isEnabled = false
+            // Optionally request immediately, or wait for button click
+            // requestAppropriateStoragePermissions()
         }
     }
 
+    // Helper function within SearchFragment
+    private fun getEmbeddingsForIds(internalIds: List<Long>): List<ImageEmbedding> {
+        Log.d("SearchFragment", "getEmbeddingsForIds called. Requesting ${internalIds.size} IDs.")
+        if (internalIds.isEmpty()) {
+            Log.d("SearchFragment", "getEmbeddingsForIds: Requested ID list is empty, returning empty list.")
+            return emptyList() // Return early if no IDs requested
+        }
 
+        // Use the map directly from the ViewModel
+        val allEmbeddingsMap = mORTImageViewModel.getAllLoadedEmbeddingsMap()
+        Log.d("SearchFragment", "getEmbeddingsForIds: Current map size in ORTViewModel: ${allEmbeddingsMap.size}")
+        Log.d("SearchFragment", "getEmbeddingsForIds: First 5 requested IDs: ${internalIds.take(5)}")
+
+        // Efficiently map and filter out nulls if any ID wasn't found
+        val results = internalIds.mapNotNull { id ->
+            val embedding = allEmbeddingsMap[id]
+            if (embedding == null && internalIds.size < 20) { // Log misses only for smaller lists to avoid spam
+                Log.w("SearchFragment", "getEmbeddingsForIds: Embedding NOT found in map for ID: $id")
+            }
+            embedding // mapNotNull filters nulls
+        }
+        Log.d("SearchFragment", "getEmbeddingsForIds: Found ${results.size} embeddings out of ${internalIds.size} requested.")
+        return results
+    }
+
+    // Helper function to determine the URI from an ImageEmbedding object
+    private fun determineUriFromEmbedding(embedding: ImageEmbedding): Uri? {
+        return when {
+            // Prefer Document URI if available
+            !embedding.documentUri.isNullOrBlank() -> {
+                try { embedding.documentUri.toUri() }
+                catch (e: Exception) { Log.e("SearchFragment", "Error parsing documentUri: ${embedding.documentUri}", e); null }
+            }
+            // Fallback to MediaStore ID
+            embedding.mediaStoreId != null -> {
+                try { ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, embedding.mediaStoreId) }
+                catch (e: Exception) { Log.e("SearchFragment", "Error creating MediaStore URI for ID: ${embedding.mediaStoreId}", e); null }
+            }
+            // No usable URI found
+            else -> null
+        }
+    }
 
 }
