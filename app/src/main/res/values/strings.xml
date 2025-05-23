@@ -15,8 +15,8 @@
     <string name="index_status_processing">Index Status: Processing</string>
     <string name="indexing_scope_all">Indexing: All Photos</string>
     <string name="indexing_scope_folder">Indexing folder: %1$s</string>
-    <string name="select_folder_button">Select Folder</string>
-    <string name="clear_selection_button">CLEAR SELECTION</string>
+    <string name="select_folder_button">Select\nFolder</string>
+    <string name="clear_selection_button">CLEAR\nSELECTION</string>
     <string name="folder_selected_toast">Folder selected. Clear index and re-index to apply.</string>
     <string name="selection_cleared_toast">Folder restriction cleared. Clear index and re-index to apply.</string>
     <string name="error_persisting_permission">Error saving folder permission.</string>

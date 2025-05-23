@@ -38,6 +38,13 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
         _selectedItemIds.value = emptySet()
     }
 
+    // For tracking long UI operations like delete/move
+    private val _uiOperationInProgress = MutableLiveData<Boolean>(false)
+    val uiOperationInProgress: LiveData<Boolean> = _uiOperationInProgress
+
+    fun setUiOperationInProgress(isInProgress: Boolean) {
+        _uiOperationInProgress.postValue(isInProgress)
+    }
 
 
 }

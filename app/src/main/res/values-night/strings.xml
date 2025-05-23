@@ -7,8 +7,8 @@
     <string name="enlarge_image">Enlarge</string>
     <string name="index_status_idle">IDLE STATUS</string>
     <string name="indexing_scope_all">INDEX SCOPE</string>
-    <string name="select_folder_button">SELECT FOLDER</string>
-    <string name="clear_selection_button">CLEAR SELECTION</string>
+    <string name="select_folder_button">SELECT\nFOLDER</string>
+    <string name="clear_selection_button">CLEAR\nSELECTION</string>
     <string name="index_button">START INDEXING</string>
     <string name="go_to_search_button">GOTO SEARCH</string>
     <string name="folder_selected_toast">Folder Selected</string>

@@ -46,6 +46,7 @@ import com.slavabarkov.tidy.adapters.ImageItemDetailsLookup
 import com.slavabarkov.tidy.adapters.ImageItemKeyProvider
 import java.io.File
 import android.provider.DocumentsContract
+import android.widget.ProgressBar
 import androidx.activity.result.IntentSenderRequest
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
@@ -80,7 +81,10 @@ class SearchFragment : Fragment() {
     private lateinit var folderPickerLauncher: ActivityResultLauncher<Uri?> // Added RequiresApi below
     private lateinit var storagePermissionLauncher: ActivityResultLauncher<Array<String>> // Added RequiresApi below
     private lateinit var manageStorageLauncher: ActivityResultLauncher<Intent> // Added RequiresApi below
-
+    private var operationProgressBar: ProgressBar? = null
+    private var progressOverlay: View? = null
+    // 1. Add the TextView declaration
+    private var operationProgressText: TextView? = null
 
     @RequiresApi(Build.VERSION_CODES.R) // Added RequiresApi here due to launchers
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -212,6 +216,9 @@ class SearchFragment : Fragment() {
         val currentEmbeddings = getEmbeddingsForIds(currentSearchIds ?: emptyList())
         Log.d("SearchFragment", "onResume: Fetched embeddings for adapter. Count: ${currentEmbeddings.size}")
 
+        listCount = mSearchViewModel.searchResults?.size ?: 0 // Use safe call and provide a default
+        Log.d("SearchFragment", "onResume: Updated listCount to $listCount")
+
         // Update the adapter
         if (::imageAdapter.isInitialized) {
             imageAdapter.updateData(currentEmbeddings)
@@ -230,11 +237,22 @@ class SearchFragment : Fragment() {
             mSearchViewModel.fromImg2ImgFlag = false
             Log.d("SearchFragment", "onResume: Reset fromImg2ImgFlag to false.")
         }
+        // Update the selectedCountTextView.
+        // If a selection exists, updateSelectionUi() will correctly format the "selected/total" text.
+        // If no selection, it will show "total Images".
+        // Making it visible here ensures it shows up. updateSelectionUi() will refine the text.
+        selectedCountTextView?.visibility = View.VISIBLE
 
-        if(!selectionTracker.hasSelection()) {
-            listCount = mSearchViewModel.searchResults?.size!!
-            selectedCountTextView?.visibility = View.VISIBLE
-            selectedCountTextView?.text = "$listCount Images"
+        // Call updateSelectionUi() to refresh the text based on current selection
+        // and the now updated listCount. This is important if returning to the fragment
+        // with an existing selection.
+        if (::selectionTracker.isInitialized) { // Ensure tracker is initialized
+            updateSelectionUi()
+        } else {
+            // Fallback if tracker not ready, though updateSelectionUi will also be called in onViewCreated
+            if (!selectionTracker.hasSelection()) {
+                selectedCountTextView?.text = "$listCount Images"
+            }
         }
     }
     // --- END: onResume with Consistency Check ---
@@ -255,8 +273,10 @@ class SearchFragment : Fragment() {
         deleteButton = view.findViewById(R.id.deleteButton)
         clearButton = view.findViewById(R.id.clearButton)
         selectedCountTextView = view.findViewById<TextView>(R.id.selectedCountTextView)
-
-
+        operationProgressBar = view.findViewById(R.id.operationProgressBar)
+        progressOverlay = view.findViewById(R.id.progress_overlay)
+        // 2. Find the TextView in onCreateView or onViewCreated
+        operationProgressText = view.findViewById(R.id.operationProgressText)
         // --- START: Reverted Data Initialization ---
         // Initialize searchResults ONLY if it's null in the ViewModel.
         // This preserves the existing list (e.g., search results) when the view is recreated.
@@ -392,7 +412,26 @@ class SearchFragment : Fragment() {
 
         // --- STEP 6: Add Selection Observer ---
         addSelectionObserver()
+        // --- START: Observe uiOperationInProgress ---
+        mSearchViewModel.uiOperationInProgress.observe(viewLifecycleOwner) { isInProgress ->
+            Log.d("SearchFragment", "uiOperationInProgress changed: $isInProgress")
+            progressOverlay?.visibility = if (isInProgress) View.VISIBLE else View.GONE
+            operationProgressBar?.visibility = if (isInProgress) View.VISIBLE else View.GONE
+            // Disable/Enable other UI elements
+            recyclerView.isEnabled = !isInProgress // Example: disable RecyclerView
+            searchButton?.isEnabled = !isInProgress
+            clearButton?.isEnabled = !isInProgress
+            // The delete/move buttons' visibility is already handled by selection,
+            // but we should also consider their enabled state.
+            deleteButton?.isEnabled = !isInProgress && selectionTracker.hasSelection()
+            moveButton?.isEnabled = !isInProgress && selectionTracker.hasSelection() && hasStoragePermission()
 
+            // Prevent interaction with RecyclerView items by making it non-clickable
+            recyclerView.isClickable = !isInProgress
+            recyclerView.isFocusable = !isInProgress
+            // You might need to iterate through children if the above is not enough
+            // or set an overlay view.
+        }
         // --- Setup listeners that might depend on tracker state / UI elements ---
         moveButton?.setOnClickListener {
             Log.d("SearchFragment", "Move button clicked")
@@ -417,6 +456,7 @@ class SearchFragment : Fragment() {
 
         Log.d("LifecycleDebug", "onViewCreated finished")
     }
+    // --- END: Observe uiOperationInProgress ---
 
     // --- Add onSaveInstanceState to save tracker state ---
     override fun onSaveInstanceState(outState: Bundle) {
@@ -494,6 +534,8 @@ class SearchFragment : Fragment() {
     @RequiresApi(Build.VERSION_CODES.R) // Keep RequiresApi for consistency
     private fun moveImagesToFolder(destinationFolderUri: Uri) {
         Log.d("SearchFragment", "moveImagesToFolder started. Destination: $destinationFolderUri")
+        mSearchViewModel.setUiOperationInProgress(true)
+        operationProgressText?.visibility = View.VISIBLE
         val selectedInternalIds = selectionTracker.selection.toList()
         if (selectedInternalIds.isEmpty()) {
             Toast.makeText(context, "No items selected.", Toast.LENGTH_SHORT).show()
@@ -501,6 +543,7 @@ class SearchFragment : Fragment() {
         }
 
         val embeddingsToProcess = getEmbeddingsForIds(selectedInternalIds)
+        val totalFiles = embeddingsToProcess.size  // Total files to move
         if (embeddingsToProcess.isEmpty()) {
             Toast.makeText(context, "Could not find data for selected items.", Toast.LENGTH_SHORT).show()
             return
@@ -533,10 +576,12 @@ class SearchFragment : Fragment() {
             val mediaStoreUrisToModify = mediaStoreItems.map { it.first }
             Log.d("SearchFragment", "Requesting write permission for ${mediaStoreUrisToModify.size} MediaStore URIs.")
             try {
-                // Use createWriteRequest for API 29+ as it's the standard way to request modification permission
-                val pendingIntent: PendingIntent = MediaStore.createWriteRequest(contentResolver, mediaStoreUrisToModify)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    // Use createWriteRequest for API 29+ as it's the standard way to request modification permission
+                    val pendingIntent: PendingIntent =
+                        MediaStore.createWriteRequest(contentResolver, mediaStoreUrisToModify)
 
-                if (pendingIntent != null) {
+                    if (pendingIntent != null) {
                     val intentSenderRequest = IntentSenderRequest.Builder(pendingIntent).build()
                     pendingMediaStoreMoveItems = mediaStoreItems
                     pendingMoveDestinationUri = destinationFolderUri
@@ -547,12 +592,15 @@ class SearchFragment : Fragment() {
                     Toast.makeText(context, "Failed to create permission request.", Toast.LENGTH_SHORT).show()
                     handleMoveCompletion(emptyList(), mediaStoreItems.map { it.second })
                 }
-
+            } else {
+                    performMediaStoreMove(mediaStoreItems,destinationFolderUri)
+            }
             } catch (e: Exception) {
                 Log.e("SearchFragment", "Error creating or launching write request for MediaStore items", e)
                 Toast.makeText(context, "Failed to request permission for MediaStore items.", Toast.LENGTH_SHORT).show()
                 handleMoveCompletion(emptyList(), mediaStoreItems.map { it.second })
             }
+                operationProgressText?.visibility = View.GONE
         }
 
         // --- 3. Handle DocumentFile items ---
@@ -570,13 +618,13 @@ class SearchFragment : Fragment() {
                     val successfullyMovedDocIds = mutableListOf<Long>()
                     val failedDocIds = mutableListOf<Long>()
 
-                    documentFileItems.forEach { (sourceUri, internalId) ->
+                    documentFileItems.forEachIndexed { index, (sourceUri, internalId) ->
                         try {
                             val sourceDocFile = DocumentFile.fromSingleUri(requireContext(), sourceUri)
                             if (sourceDocFile == null || !sourceDocFile.exists()) {
                                 Log.w("SearchFragment", "Source DocumentFile not found or accessible: $sourceUri")
                                 failedDocIds.add(internalId)
-                                return@forEach
+                                return@forEachIndexed
                             }
 
                             val sourceFileName = sourceDocFile.name ?: "file_${System.currentTimeMillis()}"
@@ -596,6 +644,12 @@ class SearchFragment : Fragment() {
                                     moved = (movedUri != null)
                                     if (moved) Log.d("SearchFragment", "Moved using DocumentsContract.moveDocument: $sourceFileName to $movedUri")
                                     else Log.w("SearchFragment", "DocumentsContract.moveDocument returned null for: $sourceFileName")
+
+                                    withContext(Dispatchers.Main) {
+                                        val progressPercentage = (((index + 1).toDouble() / totalFiles) * 100).toInt()
+                                        val progressText = "$progressPercentage%"
+                                        operationProgressText?.text = progressText
+                                    }
                                 } catch (e: Exception) {
                                     Log.w("SearchFragment", "DocumentsContract.moveDocument failed for $sourceFileName, falling back to copy/delete.", e)
                                     moved = false
@@ -666,6 +720,10 @@ class SearchFragment : Fragment() {
                             // Selection cleared in handleMoveCompletion
                         }
                     }
+                    withContext(Dispatchers.Main) {
+                        // ... (Existing completion logic)
+                        operationProgressText?.visibility = View.GONE
+                    }
                 } // End lifecycleScope.launch(Dispatchers.IO)
             } // End else (destination is valid)
         } // End if (documentFileItems.isNotEmpty())
@@ -677,7 +735,7 @@ class SearchFragment : Fragment() {
             val successfullyMovedIds = mutableListOf<Long>()
             val failedIds = mutableListOf<Long>()
             val contentResolver = requireContext().contentResolver
-
+            val totalFiles = itemsToMove.size
             // Try to get a relative path suitable for MediaStore (API 29+)
             // This might fail if the destination is not a standard MediaStore location
             val relativePath = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -689,7 +747,7 @@ class SearchFragment : Fragment() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && relativePath != null) {
                 // --- Use MediaStore API (ContentResolver.update) for API 29+ ---
                 Log.d("SearchFragment", "Attempting MediaStore move using relativePath: $relativePath")
-                itemsToMove.forEach { (sourceUri, internalId) ->
+                itemsToMove.forEachIndexed { index, (sourceUri, internalId) ->
                     try {
                         val values = ContentValues().apply {
                             put(MediaStore.Images.Media.IS_PENDING, 1) // Mark as pending
@@ -706,6 +764,11 @@ class SearchFragment : Fragment() {
                         if (updatedRows > 0) {
                             Log.d("SearchFragment", "MediaStore update successful for ID: $internalId")
                             successfullyMovedIds.add(internalId)
+                            withContext(Dispatchers.Main) {
+                                val progressPercentage = (((index + 1).toDouble() / totalFiles) * 100).toInt()
+                                val progressText = "$progressPercentage%"
+                                operationProgressText?.text = progressText
+                            }
                         } else {
                             Log.w("SearchFragment", "MediaStore update failed (0 rows) for ID: $internalId. Trying copy/delete fallback.")
                             // Attempt copy/delete as fallback if update fails
@@ -831,6 +894,7 @@ class SearchFragment : Fragment() {
 
     // --- Placeholder for handling completion ---
     private fun handleMoveCompletion(movedInternalIds: List<Long>, failedInternalIds: List<Long>) {
+        mSearchViewModel.setUiOperationInProgress(false)
         // --- 1. Update Database/ViewModel ---
         if (movedInternalIds.isNotEmpty()) {
             lifecycleScope.launch(Dispatchers.IO) {
@@ -901,6 +965,14 @@ class SearchFragment : Fragment() {
             if (toastMessage.isNotBlank()) {
                 Toast.makeText(context, toastMessage.trim(), Toast.LENGTH_LONG).show()
             }
+            // --- START: Ensure UI operation state is reset if not already by a more specific path ---
+            // This is a fallback. Ideally, setUiOperationInProgress(false) is called
+            // more precisely where each specific operation (MediaStore move, DocFile move, Delete) concludes.
+            if (mSearchViewModel.uiOperationInProgress.value == true) {
+                Log.d("SearchFragment", "updateAdapterAfterModification: Resetting UI operation flag as a fallback.")
+                mSearchViewModel.setUiOperationInProgress(false)
+            }
+            // --- END: Ensure UI operation state is reset ---
         }
     }
 
@@ -974,6 +1046,10 @@ class SearchFragment : Fragment() {
             .setMessage(message)
             .setPositiveButton("Delete") { dialog, which ->
                 Log.d("SearchFragment", "User confirmed deletion for $itemCount items.")
+                // --- START: Set UI operation in progress ---
+                mSearchViewModel.setUiOperationInProgress(true)
+                operationProgressText?.visibility = View.VISIBLE
+                // --- END: Set UI operation in progress ---
                 initiateMediaStoreDeletion(selectedIdsInternal)
             }
             .setNegativeButton("Cancel") { dialog, which ->
@@ -984,12 +1060,15 @@ class SearchFragment : Fragment() {
     }
 
     private fun initiateMediaStoreDeletion(selectedInternalIds: List<Long>) {
-        if (selectedInternalIds.isEmpty()) return
+        if (selectedInternalIds.isEmpty()){
+            mSearchViewModel.setUiOperationInProgress(false) // Reset if no items
+            return }
 
         val contentResolver = requireContext().contentResolver
         val embeddingsToDelete = getEmbeddingsForIds(selectedInternalIds)
         if (embeddingsToDelete.isEmpty()) {
             Log.w("SearchFragment", "Could not find embedding data for selected internal IDs: $selectedInternalIds")
+            operationProgressText?.visibility = View.GONE
             Toast.makeText(context, "Error finding items to delete.", Toast.LENGTH_SHORT).show()
             return
         }
@@ -999,6 +1078,7 @@ class SearchFragment : Fragment() {
         }
         if (urisAndIdsToDelete.isEmpty()) {
             Log.w("SearchFragment", "Could not resolve URIs for selected internal IDs.")
+            operationProgressText?.visibility = View.GONE
             Toast.makeText(context, "Error resolving items to delete.", Toast.LENGTH_SHORT).show()
             return
         }
@@ -1039,10 +1119,11 @@ class SearchFragment : Fragment() {
         val failedInternalIds = mutableListOf<Long>()
         var permissionNeededIntentSender: IntentSender? = null
         var permissionNeededId: Long? = null // Track ID needing permission
-
+        val totalFiles = urisAndIdsToDelete.size
         Log.d("DeletionLoop", "Starting loop for ${urisAndIdsToDelete.size} items (API <= 29)")
 
-        for ((imageUri, internalId) in urisAndIdsToDelete) {
+        for ((index, pair) in urisAndIdsToDelete.withIndex()) {
+            val (imageUri, internalId) = pair
             try {
                 Log.d("DeletionLoop", "Attempting delete for InternalID: $internalId, URI: $imageUri")
                 var deleted = false
@@ -1074,6 +1155,10 @@ class SearchFragment : Fragment() {
                 if (deleted) {
                     Log.d("DeletionLoop", "Successfully deleted item for InternalID: $internalId")
                     successfullyDeletedInternalIds.add(internalId)
+                    withContext(Dispatchers.Main) {
+                        val progressText = "Success: ${index + 1}/$totalFiles files"
+                        operationProgressText?.text = progressText
+                    }
                 } else {
                     // Add to failed list ONLY IF no permission prompt was triggered for it
                     if (internalId != permissionNeededId) {
@@ -1121,7 +1206,9 @@ class SearchFragment : Fragment() {
 
     private fun handleSuccessfulDeletion(successfullyDeletedInternalIds: List<Long>, failedInternalIds: List<Long>){
         Log.d("SearchFragment", "handleSuccessfulDeletion: Success count=${successfullyDeletedInternalIds.size}, Fail count=${failedInternalIds.size}")
-
+        // This is a key place to reset, as it's the common end-point for delete operations.
+        mSearchViewModel.setUiOperationInProgress(false)
+        operationProgressText?.visibility = View.GONE
         if (successfullyDeletedInternalIds.isNotEmpty()) {
             // 1. Call ViewModel to update DB and its internal lists
             lifecycleScope.launch(Dispatchers.IO) {
@@ -1160,10 +1247,15 @@ class SearchFragment : Fragment() {
         val hasSelection = selectedCount > 0
         val lsCount = listCount
         Log.d("SelectionUI", "Updating UI. Count: $selectedCount, HasSelection: $hasSelection")
-
+        // Only enable move/delete buttons if an operation is NOT already in progress
+        val operationInProgress = mSearchViewModel.uiOperationInProgress.value ?: false
         moveButton?.visibility = if (hasSelection) View.VISIBLE else View.GONE
         deleteButton.visibility = if (hasSelection) View.VISIBLE else View.GONE
         //selectedCountTextView?.visibility = if (hasSelection) View.VISIBLE else View.GONE
+
+        moveButton?.isEnabled = hasSelection && !operationInProgress && hasStoragePermission()
+        deleteButton?.isEnabled = hasSelection && !operationInProgress
+
         if (hasSelection) {
             selectedCountTextView?.text = "$selectedCount/$lsCount items selected"
         }else {
