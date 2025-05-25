@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Circle background -->
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="#DDDDDD" />
+            <size
+                android:width="100dp"
+                android:height="100dp" />
+        </shape>
+    </item>
+
+
+    <!-- Progress arc -->
+    <item>
+        <rotate
+            android:fromDegrees="-90"
+            android:pivotX="50%"
+            android:pivotY="50%"
+            android:toDegrees="-90">
+            <shape
+                android:shape="ring"
+                android:useLevel="true"
+                android:innerRadiusRatio="2.5"
+                android:thicknessRatio="8"
+                >
+                <solid android:color="@color/teal_200" />
+            </shape>
+        </rotate>
+    </item>
+    <!-- Inner circle -->
+    <item android:drawable="@drawable/progress_inner_circle"
+        android:top="30dp"
+        android:bottom="30dp"
+        android:left="30dp"
+        android:right="30dp"
+        />
+</layer-list>

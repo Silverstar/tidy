@@ -38,8 +38,8 @@
                 android:textSize="16sp"
                 android:textStyle="bold"
                 android:visibility="gone"
-                tools:visibility="visible"
-                tools:text="3 items selected"/>
+                tools:text="3 items selected"
+                tools:visibility="visible" />
 
             <LinearLayout
                 android:id="@+id/searchClearButtonLayout"
@@ -66,6 +66,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="@string/clear" />
+
             </LinearLayout>
         </LinearLayout>
 
@@ -98,6 +99,19 @@
                 android:text="@string/move"
                 android:visibility="gone"
                 tools:visibility="visible" />
+
+            <Space
+                android:layout_width="10dp"
+                android:layout_height="wrap_content" />
+
+            <CheckBox
+                    android:id="@+id/selectAllCheckbox"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:visibility="gone"
+                    android:text="@string/select_all"
+                    tools:visibility="visible" />
+
         </LinearLayout>
 
         <androidx.recyclerview.widget.RecyclerView
@@ -124,12 +138,28 @@
         app:layout_constraintTop_toTopOf="parent"
         tools:visibility="gone" />
 
+<!--    <ProgressBar-->
+<!--        android:id="@+id/operationProgressBar"-->
+<!--        style="?android:attr/progressBarStyleLarge"-->
+<!--        android:layout_width="98dp"-->
+<!--        android:layout_height="108dp"-->
+<!--        android:visibility="gone"-->
+<!--        app:layout_constraintBottom_toBottomOf="parent"-->
+<!--        app:layout_constraintEnd_toEndOf="parent"-->
+<!--        app:layout_constraintStart_toStartOf="parent"-->
+<!--        app:layout_constraintTop_toTopOf="parent"-->
+<!--        tools:visibility="gone" />-->
+
     <ProgressBar
         android:id="@+id/operationProgressBar"
-        style="?android:attr/progressBarStyleLarge"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="100dp"
+        android:layout_height="108dp"
+        android:indeterminate="true"
+        android:indeterminateDrawable="@drawable/progress_bar"
         android:visibility="gone"
+        android:paddingHorizontal="1dp"
+        android:paddingVertical="2dp"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
@@ -145,14 +175,16 @@
         android:textAlignment="center"
         android:textAppearance="@style/TextAppearance.AppCompat.Medium"
         android:textColor="@color/purple_500"
-        android:textSize="30sp"
+        android:textSize="15sp"
         android:textStyle="bold"
         android:theme="@style/Theme.TIDY"
-        android:visibility="gone"
+        android:visibility="visible"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toBottomOf="@+id/operationProgressBar"
+        app:layout_constraintLeft_toLeftOf="@+id/operationProgressBar"
+        app:layout_constraintRight_toRightOf="@+id/operationProgressBar"
+        app:layout_constraintCircle="@+id/operationProgressBar"
         tools:text="0%"
         tools:visibility="visible" />
 

@@ -46,6 +46,7 @@ import com.slavabarkov.tidy.adapters.ImageItemDetailsLookup
 import com.slavabarkov.tidy.adapters.ImageItemKeyProvider
 import java.io.File
 import android.provider.DocumentsContract
+import android.widget.CheckBox
 import android.widget.ProgressBar
 import androidx.activity.result.IntentSenderRequest
 import androidx.lifecycle.lifecycleScope
@@ -85,6 +86,7 @@ class SearchFragment : Fragment() {
     private var progressOverlay: View? = null
     // 1. Add the TextView declaration
     private var operationProgressText: TextView? = null
+    private var selectAllCheckbox: CheckBox? = null
 
     @RequiresApi(Build.VERSION_CODES.R) // Added RequiresApi here due to launchers
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -277,6 +279,7 @@ class SearchFragment : Fragment() {
         progressOverlay = view.findViewById(R.id.progress_overlay)
         // 2. Find the TextView in onCreateView or onViewCreated
         operationProgressText = view.findViewById(R.id.operationProgressText)
+        selectAllCheckbox = view.findViewById(R.id.selectAllCheckbox)
         // --- START: Reverted Data Initialization ---
         // Initialize searchResults ONLY if it's null in the ViewModel.
         // This preserves the existing list (e.g., search results) when the view is recreated.
@@ -363,6 +366,20 @@ class SearchFragment : Fragment() {
             recyclerView.scrollToPosition(0)
         }
 
+        // Set up Select All checkbox listener
+        selectAllCheckbox?.setOnClickListener {
+            if (selectAllCheckbox?.isChecked == true) {
+                // Select all items
+                val allItemIds = imageAdapter.getDataset().map { it.internalId }.toSet()
+                selectionTracker.setItemsSelected(allItemIds, true)
+                Log.d("SelectAll", "Selected all ${allItemIds.size} items.")
+            } else {
+                // Deselect all items
+                selectionTracker.clearSelection()
+                Log.d("SelectAll", "Deselected all items.")
+            }
+        }
+
         return view
     }
 
@@ -425,7 +442,7 @@ class SearchFragment : Fragment() {
             // but we should also consider their enabled state.
             deleteButton?.isEnabled = !isInProgress && selectionTracker.hasSelection()
             moveButton?.isEnabled = !isInProgress && selectionTracker.hasSelection() && hasStoragePermission()
-
+            selectAllCheckbox?.isEnabled = !isInProgress // Disable select all during operation
             // Prevent interaction with RecyclerView items by making it non-clickable
             recyclerView.isClickable = !isInProgress
             recyclerView.isFocusable = !isInProgress
@@ -1156,7 +1173,8 @@ class SearchFragment : Fragment() {
                     Log.d("DeletionLoop", "Successfully deleted item for InternalID: $internalId")
                     successfullyDeletedInternalIds.add(internalId)
                     withContext(Dispatchers.Main) {
-                        val progressText = "Success: ${index + 1}/$totalFiles files"
+                        val progressPercentage = (((index + 1).toDouble() / totalFiles) * 100).toInt()
+                        val progressText = "$progressPercentage%"
                         operationProgressText?.text = progressText
                     }
                 } else {
@@ -1242,10 +1260,11 @@ class SearchFragment : Fragment() {
 
     private fun updateSelectionUi() {
         if (!::selectionTracker.isInitialized) return // Safety check
-
+        val totalItems = imageAdapter.itemCount // Get total items from adapter
         val selectedCount = selectionTracker.selection.size()
         val hasSelection = selectedCount > 0
         val lsCount = listCount
+
         Log.d("SelectionUI", "Updating UI. Count: $selectedCount, HasSelection: $hasSelection")
         // Only enable move/delete buttons if an operation is NOT already in progress
         val operationInProgress = mSearchViewModel.uiOperationInProgress.value ?: false
@@ -1258,10 +1277,14 @@ class SearchFragment : Fragment() {
 
         if (hasSelection) {
             selectedCountTextView?.text = "$selectedCount/$lsCount items selected"
+            selectAllCheckbox?.visibility = View.VISIBLE // Show select all when selection is active
+            selectAllCheckbox?.isChecked = (selectedCount == totalItems) // Check if all are selected
         }else {
 
             selectedCountTextView?.text = "$lsCount Images" // Clear text when not visible
             // selectedCountTextView?.visibility = View.GONE // Visibility handled above
+            selectAllCheckbox?.visibility = View.GONE // Hide select all when no selection
+            selectAllCheckbox?.isChecked = false // Ensure it's unchecked when hidden
         }
     }
 
