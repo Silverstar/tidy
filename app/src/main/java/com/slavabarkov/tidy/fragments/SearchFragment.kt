@@ -280,6 +280,7 @@ class SearchFragment : Fragment() {
         // 2. Find the TextView in onCreateView or onViewCreated
         operationProgressText = view.findViewById(R.id.operationProgressText)
         selectAllCheckbox = view.findViewById(R.id.selectAllCheckbox)
+
         // --- START: Reverted Data Initialization ---
         // Initialize searchResults ONLY if it's null in the ViewModel.
         // This preserves the existing list (e.g., search results) when the view is recreated.
@@ -1298,7 +1299,7 @@ class SearchFragment : Fragment() {
             Log.d("SearchFragment", "Storage permission NOT granted.")
             moveButton?.isEnabled = false
             // Optionally request immediately, or wait for button click
-            // requestAppropriateStoragePermissions()
+             requestAppropriateStoragePermissions()
         }
     }
 
