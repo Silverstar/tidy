@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - dev2
-  workflow_dispatch:
 
 jobs:
   build:
@@ -27,7 +26,7 @@ jobs:
       run: ./gradlew assembleDebug
 
     - name: Upload APK
-      uses: actions/upload-artifact@v3.1.3
+      uses: actions/upload-artifact@4
       with:
         name: Tidy-debug-apk
         path: app/build/outputs/apk/debug/app-debug.apk
